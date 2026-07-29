@@ -101,35 +101,84 @@ function formatBytes(n) {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+// Emoji stand-ins for a file-type icon - good enough for a prototype
+// without pulling in an icon font/library.
+const TYPE_ICON = { video: "🎬", audio: "🎵", application_pdf: "📄", text: "📝" };
+function iconFor(type) {
+  if (type === "application/pdf") return TYPE_ICON.application_pdf;
+  const kind = (type || "").split("/")[0];
+  return TYPE_ICON[kind] || "📦";
+}
+
+// Object URLs created for auto-loaded image thumbnails - tracked so they
+// can all be revoked before the next render, otherwise every refresh
+// leaks the previous batch (Blob URLs aren't garbage-collected on their
+// own).
+let thumbnailObjectUrls = [];
+function revokeThumbnails() {
+  for (const url of thumbnailObjectUrls) URL.revokeObjectURL(url);
+  thumbnailObjectUrls = [];
+}
+
+async function loadThumbnail(entry, imgEl) {
+  try {
+    const fileBytes = await fetchEntryBytes(entry);
+    const url = URL.createObjectURL(new Blob([fileBytes], { type: entry.type }));
+    thumbnailObjectUrls.push(url);
+    imgEl.src = url;
+    imgEl.classList.remove("loading");
+  } catch {
+    imgEl.replaceWith(Object.assign(document.createElement("div"), { className: "file-icon", textContent: "⚠️" }));
+  }
+}
+
 function renderList(entries) {
+  revokeThumbnails();
   els.fileList.innerHTML = "";
+  els.fileList.className = "file-grid";
   if (entries.length === 0) {
     els.fileList.innerHTML = '<li class="empty">No files yet.</li>';
     return;
   }
   for (const entry of [...entries].reverse()) {
     const li = document.createElement("li");
-    li.className = "file-row";
+    li.className = "file-tile";
+    li.title = `${entry.name} · ${formatBytes(entry.size)} · ${new Date(entry.uploadedAt).toLocaleString()}`;
+    li.onclick = () => previewEntry(entry);
 
-    const info = document.createElement("span");
-    info.className = "file-info";
-    info.textContent = `${entry.name} · ${formatBytes(entry.size)} · ${new Date(entry.uploadedAt).toLocaleString()}`;
+    const thumb = document.createElement("div");
+    thumb.className = "file-thumb";
+    if (entry.type?.startsWith("image/")) {
+      const img = document.createElement("img");
+      img.className = "loading";
+      img.alt = entry.name;
+      thumb.appendChild(img);
+      loadThumbnail(entry, img); // fire-and-forget - fills in once decrypted
+    } else {
+      const icon = document.createElement("div");
+      icon.className = "file-icon";
+      icon.textContent = iconFor(entry.type);
+      thumb.appendChild(icon);
+    }
 
-    const previewBtn = document.createElement("button");
-    previewBtn.textContent = "Preview";
-    previewBtn.className = "secondary";
-    previewBtn.onclick = () => previewEntry(entry);
+    const name = document.createElement("span");
+    name.className = "file-tile-name";
+    name.textContent = entry.name;
 
+    const actions = document.createElement("div");
+    actions.className = "file-tile-actions";
     const downloadBtn = document.createElement("button");
-    downloadBtn.textContent = "Download";
-    downloadBtn.onclick = () => downloadEntry(entry);
-
+    downloadBtn.textContent = "⭳";
+    downloadBtn.title = "Download";
+    downloadBtn.onclick = (e) => { e.stopPropagation(); downloadEntry(entry); };
     const deleteBtn = document.createElement("button");
-    deleteBtn.textContent = "Remove";
+    deleteBtn.textContent = "✕";
+    deleteBtn.title = "Remove";
     deleteBtn.className = "danger";
-    deleteBtn.onclick = () => removeEntry(entry.id);
+    deleteBtn.onclick = (e) => { e.stopPropagation(); removeEntry(entry.id); };
+    actions.append(downloadBtn, deleteBtn);
 
-    li.append(info, previewBtn, downloadBtn, deleteBtn);
+    li.append(thumb, name, actions);
     els.fileList.appendChild(li);
   }
 }
