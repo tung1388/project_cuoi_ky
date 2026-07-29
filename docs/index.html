@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>githost</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main>
+    <h1>githost</h1>
+    <p class="subtitle">Encrypted file storage on GitHub, served via jsDelivr. Nothing here ever leaves your browser unencrypted.</p>
+
+    <form id="login-form" class="card">
+      <h2>Connect</h2>
+      <label>
+        Repo owner
+        <input id="login-owner" type="text" autocomplete="off" placeholder="e.g. tung1388" />
+      </label>
+      <label>
+        Repo name
+        <input id="login-repo" type="text" autocomplete="off" placeholder="e.g. project_cuoi_ky" />
+      </label>
+      <label>
+        Your folder
+        <input id="login-folder" type="text" autocomplete="off" placeholder="e.g. quantran" />
+      </label>
+      <label>
+        Encryption key
+        <input id="login-key" type="password" autocomplete="off" />
+      </label>
+      <p id="login-status" class="hint"></p>
+      <p id="login-error" class="error"></p>
+      <button type="submit">Connect</button>
+      <p class="hint">No access token needed - your key unlocks a stored, encrypted one for your folder. Everything above is saved only in this browser's local storage.</p>
+    </form>
+
+    <section id="app" class="card hidden">
+      <div class="app-header">
+        <span id="whoami"></span>
+        <button id="logout-btn" class="secondary">Disconnect</button>
+      </div>
+
+      <div class="upload-row">
+        <label class="upload-btn">
+          Upload a file
+          <input id="file-input" type="file" class="hidden" />
+        </label>
+        <span id="upload-status"></span>
+      </div>
+
+      <div class="list-header">
+        <h2>Your files</h2>
+        <button id="refresh-btn" class="secondary">Refresh</button>
+      </div>
+      <ul id="file-list"></ul>
+    </section>
+  </main>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
