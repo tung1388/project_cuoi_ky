@@ -1,37 +1,41 @@
 // =====================================================================
 // docs/app.js
 // ---------------------------------------------------------------------
-// Wires the login form, file list, upload, and download together.
+// Wires the login form, file list, upload, download, and preview
+// together.
 //
-// Login only asks for owner/repo/folder/key - not a raw access token.
-// On submit, resolveToken() fetches blobs/<folder>/pat.enc (unauthenti-
-// cated - nothing to authenticate with yet) and decrypts it with the
-// entered key to recover the real token an admin pre-stored via the CLI's
-// `store-pat` command. From then on, the resolved token + everything
-// else lives in localStorage only - never baked into this shipped code,
-// so the page itself has no secret to leak.
+// This page is deployed for one specific repo, so owner/repo are fixed
+// constants rather than form fields - login only asks for a username
+// (= storage folder) and password (= encryption key). On submit,
+// resolveToken() fetches blobs/<username>/pat.enc (unauthenticated -
+// nothing to authenticate with yet) and decrypts it with the entered
+// password to recover the real GitHub token an admin pre-stored via the
+// CLI's `store-pat` command. From then on, the resolved token +
+// everything else lives in localStorage only - never baked into this
+// shipped code, so the page itself has no secret to leak.
 //
-// The manifest (blob/<folder>/manifest.enc) is a single encrypted JSON
-// index of {id, name, type, size, uploadedAt} - it's how the list view
-// shows real filenames without any of that being visible to someone
-// browsing the public repo directly. It's a single shared mutable file
-// per folder, so concurrent uploads from two tabs/devices at once could
-// race and clobber each other's entry - acceptable at "one person
-// using their own folder from their own browser" scale, not something
-// this prototype tries to solve properly.
+// The manifest (blobs/<username>/manifest.enc) is a single encrypted
+// JSON index of {id, name, type, size, uploadedAt} - it's how the list
+// view shows real filenames without any of that being visible to
+// someone browsing the public repo directly. It's a single shared
+// mutable file per folder, so concurrent uploads from two tabs/devices
+// at once could race and clobber each other's entry - acceptable at
+// "one person using their own account from their own browser" scale,
+// not something this prototype tries to solve properly.
 // =====================================================================
 
 import { encryptBuffer, decryptBuffer, packEnvelope, unpackEnvelope } from "./crypto.js";
 import { getFile, putFile, getPublicFile } from "./github.js";
 
+const OWNER = "tung1388";
+const REPO = "project_cuoi_ky";
+
 const STORAGE_KEY = "githost.session";
 
 const els = {
   loginForm: document.getElementById("login-form"),
-  loginOwner: document.getElementById("login-owner"),
-  loginRepo: document.getElementById("login-repo"),
-  loginFolder: document.getElementById("login-folder"),
-  loginKey: document.getElementById("login-key"),
+  loginUsername: document.getElementById("login-username"),
+  loginPassword: document.getElementById("login-password"),
   loginStatus: document.getElementById("login-status"),
   loginError: document.getElementById("login-error"),
   app: document.getElementById("app"),
@@ -41,6 +45,10 @@ const els = {
   uploadStatus: document.getElementById("upload-status"),
   fileList: document.getElementById("file-list"),
   refreshBtn: document.getElementById("refresh-btn"),
+  previewModal: document.getElementById("preview-modal"),
+  previewTitle: document.getElementById("preview-title"),
+  previewBody: document.getElementById("preview-body"),
+  previewClose: document.getElementById("preview-close"),
 };
 
 function loadSession() {
@@ -107,6 +115,11 @@ function renderList(entries) {
     info.className = "file-info";
     info.textContent = `${entry.name} · ${formatBytes(entry.size)} · ${new Date(entry.uploadedAt).toLocaleString()}`;
 
+    const previewBtn = document.createElement("button");
+    previewBtn.textContent = "Preview";
+    previewBtn.className = "secondary";
+    previewBtn.onclick = () => previewEntry(entry);
+
     const downloadBtn = document.createElement("button");
     downloadBtn.textContent = "Download";
     downloadBtn.onclick = () => downloadEntry(entry);
@@ -116,7 +129,7 @@ function renderList(entries) {
     deleteBtn.className = "danger";
     deleteBtn.onclick = () => removeEntry(entry.id);
 
-    li.append(info, downloadBtn, deleteBtn);
+    li.append(info, previewBtn, downloadBtn, deleteBtn);
     els.fileList.appendChild(li);
   }
 }
@@ -159,14 +172,25 @@ async function handleUpload(file) {
   renderList(currentEntries);
 }
 
-async function downloadEntry(entry) {
+// Fetch + decrypt + unpack an uploaded entry - shared by download and
+// preview, which only differ in what they do with the resulting bytes.
+async function fetchEntryBytes(entry) {
   const stored = await getFile({ ...currentSession, path: blobPath(currentSession, entry.id) });
   if (!stored) {
-    alert(`${entry.name} is missing from the repo (was it deleted outside this app?).`);
-    return;
+    throw new Error(`${entry.name} is missing from the repo (was it deleted outside this app?).`);
   }
   const decrypted = await decryptBuffer(stored.bytes, currentSession.key);
-  const { fileBytes } = unpackEnvelope(decrypted);
+  return unpackEnvelope(decrypted).fileBytes;
+}
+
+async function downloadEntry(entry) {
+  let fileBytes;
+  try {
+    fileBytes = await fetchEntryBytes(entry);
+  } catch (err) {
+    alert(err.message);
+    return;
+  }
   const blob = new Blob([fileBytes], { type: entry.type });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -174,6 +198,63 @@ async function downloadEntry(entry) {
   a.download = entry.name;
   a.click();
   URL.revokeObjectURL(url);
+}
+
+// Tracks the last object URL shown in the preview modal so it can be
+// revoked when replaced or closed - otherwise each preview leaks memory
+// for as long as the page stays open.
+let previewObjectUrl = null;
+
+function closePreview() {
+  els.previewModal.classList.add("hidden");
+  els.previewBody.innerHTML = "";
+  if (previewObjectUrl) {
+    URL.revokeObjectURL(previewObjectUrl);
+    previewObjectUrl = null;
+  }
+}
+
+async function previewEntry(entry) {
+  els.previewTitle.textContent = entry.name;
+  els.previewBody.innerHTML = '<p class="hint">Decrypting…</p>';
+  els.previewModal.classList.remove("hidden");
+
+  let fileBytes;
+  try {
+    fileBytes = await fetchEntryBytes(entry);
+  } catch (err) {
+    els.previewBody.innerHTML = `<p class="error">${err.message}</p>`;
+    return;
+  }
+
+  const blob = new Blob([fileBytes], { type: entry.type });
+  const url = URL.createObjectURL(blob);
+  previewObjectUrl = url;
+  els.previewBody.innerHTML = "";
+
+  const kind = entry.type.split("/")[0];
+  let el;
+  if (kind === "image") {
+    el = document.createElement("img");
+    el.src = url;
+  } else if (kind === "video") {
+    el = document.createElement("video");
+    el.src = url;
+    el.controls = true;
+  } else if (kind === "audio") {
+    el = document.createElement("audio");
+    el.src = url;
+    el.controls = true;
+  } else if (entry.type === "application/pdf" || kind === "text") {
+    // Browsers render PDFs and plain text natively inside an <iframe>.
+    el = document.createElement("iframe");
+    el.src = url;
+  } else {
+    el = document.createElement("p");
+    el.className = "hint";
+    el.textContent = `No inline preview for ${entry.type || "this file type"} - use Download instead.`;
+  }
+  els.previewBody.appendChild(el);
 }
 
 async function removeEntry(id) {
@@ -192,54 +273,57 @@ function showApp(session) {
   currentSession = session;
   els.loginForm.classList.add("hidden");
   els.app.classList.remove("hidden");
-  els.whoami.textContent = `${session.owner}/${session.repo} · folder: ${session.folder}`;
+  els.whoami.textContent = `Logged in as ${session.folder}`;
   refresh().catch((err) => {
     els.fileList.innerHTML = `<li class="empty error">Failed to load: ${err.message}</li>`;
   });
 }
 
-// Fetches blobs/<folder>/pat.enc unauthenticated (getPublicFile - no
-// token exists yet at this point) and decrypts it with the entered key
-// to recover the real GitHub PAT an admin stored via `store-pat`. This
-// is the one request in the whole app that isn't authenticated.
-async function resolveToken({ owner, repo, folder, key }) {
-  const stored = await getPublicFile({ owner, repo, path: `blobs/${folder}/pat.enc` });
+// Fetches blobs/<username>/pat.enc unauthenticated (getPublicFile - no
+// token exists yet at this point) and decrypts it with the entered
+// password to recover the real GitHub PAT an admin stored via
+// `store-pat`. This is the one request in the whole app that isn't
+// authenticated.
+async function resolveToken({ username, password }) {
+  const stored = await getPublicFile({ owner: OWNER, repo: REPO, path: `blobs/${username}/pat.enc` });
   if (!stored) {
-    throw new Error(`No stored access token found for folder "${folder}" - ask the admin to run store-pat for you first.`);
+    throw new Error(`No account found for "${username}" - ask the admin to set one up first.`);
   }
-  const decrypted = await decryptBuffer(stored.bytes, key);
+  const decrypted = await decryptBuffer(stored.bytes, password);
   return new TextDecoder().decode(decrypted);
 }
 
 els.loginForm.addEventListener("submit", async (e) => {
   e.preventDefault();
-  const owner = els.loginOwner.value.trim();
-  const repo = els.loginRepo.value.trim();
-  const folder = els.loginFolder.value.trim();
-  const key = els.loginKey.value;
+  const username = els.loginUsername.value.trim();
+  const password = els.loginPassword.value;
 
-  if (!owner || !repo || !folder || !key) {
-    els.loginError.textContent = "All fields are required.";
+  if (!username || !password) {
+    els.loginError.textContent = "Username and password are required.";
     return;
   }
 
   els.loginError.textContent = "";
-  els.loginStatus.textContent = "Fetching your access token…";
+  els.loginStatus.textContent = "Logging in…";
   try {
-    const token = await resolveToken({ owner, repo, folder, key });
+    const token = await resolveToken({ username, password });
     els.loginStatus.textContent = "";
-    const session = { token, owner, repo, folder, key };
+    // Internally still {folder, key} - that's the vocabulary the storage
+    // layer (crypto.js/github.js/manifest logic) is built around; the
+    // username/password framing is a login-screen-only relabeling of the
+    // same underlying folder+key concept.
+    const session = { token, owner: OWNER, repo: REPO, folder: username, key: password };
     saveSession(session);
     showApp(session);
   } catch (err) {
     els.loginStatus.textContent = "";
-    // A wrong key still fetches pat.enc fine (it's public) but fails to
-    // decrypt it - GCM's auth tag check throws, which reads to the user
-    // as a generic "operation failed" from SubtleCrypto, so we give a
-    // clearer message for the common case instead of the raw error.
-    els.loginError.textContent = err.message.includes("No stored access token")
+    // A wrong password still fetches pat.enc fine (it's public) but fails
+    // to decrypt it - GCM's auth tag check throws, which reads to the
+    // user as a generic "operation failed" from SubtleCrypto, so we give
+    // a clearer message for the common case instead of the raw error.
+    els.loginError.textContent = err.message.includes("No account found")
       ? err.message
-      : "Couldn't unlock your token - check your folder name and encryption key.";
+      : "Wrong username or password.";
   }
 });
 
@@ -263,6 +347,14 @@ els.fileInput.addEventListener("change", async () => {
   } catch (err) {
     els.uploadStatus.textContent = `Upload failed: ${err.message}`;
   }
+});
+
+els.previewClose.addEventListener("click", closePreview);
+els.previewModal.addEventListener("click", (e) => {
+  if (e.target === els.previewModal) closePreview(); // click on the dimmed backdrop, not the panel itself
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !els.previewModal.classList.contains("hidden")) closePreview();
 });
 
 const existingSession = loadSession();
