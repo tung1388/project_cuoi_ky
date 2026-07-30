@@ -99,15 +99,12 @@ export async function renderSqlitePreview(bytes, container, { onSave } = {}) {
 
   toolbar.append(select, queryInput, runBtn);
 
-  let saveBtn, saveStatus, performSave;
+  let saveStatus, performSave;
   if (onSave) {
-    saveBtn = document.createElement("button");
-    saveBtn.textContent = "Save now";
     saveStatus = document.createElement("span");
     saveStatus.className = "hint";
 
     performSave = async () => {
-      saveBtn.disabled = true;
       saveStatus.textContent = "Saving…";
       try {
         // db.export() serializes the CURRENT in-memory state (including
@@ -118,12 +115,9 @@ export async function renderSqlitePreview(bytes, container, { onSave } = {}) {
         saveStatus.textContent = `Auto-saved at ${new Date().toLocaleTimeString()}.`;
       } catch (err) {
         saveStatus.textContent = `Save failed: ${err.message}`;
-      } finally {
-        saveBtn.disabled = false;
       }
     };
-    saveBtn.onclick = performSave;
-    toolbar.append(saveBtn, saveStatus);
+    toolbar.append(saveStatus);
   }
 
   const resultsEl = document.createElement("div");
