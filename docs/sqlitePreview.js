@@ -44,8 +44,15 @@ export function isSqliteFile(entry) {
  * Renders a table/query browser for `bytes` (raw decrypted SQLite file)
  * into `container`. Returns the opened sql.js Database instance so the
  * caller can close it (frees WASM memory) once the preview is dismissed.
+ *
+ * `onSave(bytes)` is optional - if provided, a "Save changes" button
+ * appears that exports the current in-memory database (via db.export())
+ * and hands the bytes to it. This module has no idea how to encrypt or
+ * upload anything (deliberately - it doesn't import crypto.js/github.js
+ * or know about sessions/manifests); the caller (app.js) supplies that
+ * logic so this stays a plain "SQLite in a box" viewer.
  */
-export async function renderSqlitePreview(bytes, container) {
+export async function renderSqlitePreview(bytes, container, { onSave } = {}) {
   container.innerHTML = '<p class="hint">Loading SQLite engine…</p>';
   let SQL;
   try {
@@ -91,6 +98,30 @@ export async function renderSqlitePreview(bytes, container) {
   runBtn.className = "secondary";
 
   toolbar.append(select, queryInput, runBtn);
+
+  if (onSave) {
+    const saveBtn = document.createElement("button");
+    saveBtn.textContent = "Save changes";
+    const saveStatus = document.createElement("span");
+    saveStatus.className = "hint";
+    saveBtn.onclick = async () => {
+      saveBtn.disabled = true;
+      saveStatus.textContent = "Saving…";
+      try {
+        // db.export() serializes the CURRENT in-memory state (including
+        // any INSERT/UPDATE/DELETE run via the query box above) back to
+        // bytes - that's the only way changes here become more than a
+        // demo, since sql.js otherwise only ever edits an in-memory copy.
+        await onSave(db.export());
+        saveStatus.textContent = "Saved.";
+      } catch (err) {
+        saveStatus.textContent = `Save failed: ${err.message}`;
+      } finally {
+        saveBtn.disabled = false;
+      }
+    };
+    toolbar.append(saveBtn, saveStatus);
+  }
 
   const resultsEl = document.createElement("div");
   resultsEl.className = "sqlite-results";

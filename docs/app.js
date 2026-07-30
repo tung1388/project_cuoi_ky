@@ -295,7 +295,25 @@ async function previewEntry(entry) {
   }
 
   if (isSqliteFile(entry)) {
-    previewSqliteDb = await renderSqlitePreview(fileBytes, els.previewBody);
+    previewSqliteDb = await renderSqlitePreview(fileBytes, els.previewBody, {
+      onSave: async (newDbBytes) => {
+        // Same overwrite pattern as any other edit: re-fetch the blob's
+        // current sha right before writing (not the one from when the
+        // preview opened) so a concurrent change elsewhere isn't clobbered
+        // blind, then update the manifest entry's size/uploadedAt in place.
+        const path = blobPath(currentSession, entry.id);
+        const current = await getFile({ ...currentSession, path });
+        const envelope = packEnvelope({ name: entry.name, type: entry.type }, newDbBytes);
+        const encrypted = await encryptBuffer(envelope, currentSession.key);
+        await putFile({ ...currentSession, path, bytes: encrypted, message: `edit: ${entry.name}`, sha: current?.sha });
+
+        entry.size = newDbBytes.length;
+        entry.uploadedAt = new Date().toISOString();
+        const { sha: manifestSha } = await loadManifest(currentSession);
+        await saveManifest(currentSession, currentEntries, manifestSha);
+        renderList(currentEntries);
+      },
+    });
     return;
   }
 
