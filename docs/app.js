@@ -26,6 +26,7 @@
 
 import { encryptBuffer, decryptBuffer, packEnvelope, unpackEnvelope } from "./crypto.js";
 import { getFile, putFile, getPublicFile } from "./github.js";
+import { isSqliteFile, renderSqlitePreview } from "./sqlitePreview.js";
 
 const OWNER = "tung1388";
 const REPO = "project_cuoi_ky";
@@ -104,9 +105,10 @@ function formatBytes(n) {
 // Emoji stand-ins for a file-type icon - good enough for a prototype
 // without pulling in an icon font/library.
 const TYPE_ICON = { video: "🎬", audio: "🎵", application_pdf: "📄", text: "📝" };
-function iconFor(type) {
-  if (type === "application/pdf") return TYPE_ICON.application_pdf;
-  const kind = (type || "").split("/")[0];
+function iconFor(entry) {
+  if (isSqliteFile(entry)) return "🗄️";
+  if (entry.type === "application/pdf") return TYPE_ICON.application_pdf;
+  const kind = (entry.type || "").split("/")[0];
   return TYPE_ICON[kind] || "📦";
 }
 
@@ -157,7 +159,7 @@ function renderList(entries) {
     } else {
       const icon = document.createElement("div");
       icon.className = "file-icon";
-      icon.textContent = iconFor(entry.type);
+      icon.textContent = iconFor(entry);
       thumb.appendChild(icon);
     }
 
@@ -195,10 +197,20 @@ async function refresh() {
   renderList(entries);
 }
 
+// Browsers generally don't recognize .sqlite/.db as a MIME type, so
+// file.type comes back as "" for them - fall back to the extension so
+// the manifest still records a type the preview can recognize later.
+function guessType(file) {
+  if (file.type) return file.type;
+  if (/\.(sqlite3?|db3?)$/i.test(file.name)) return "application/vnd.sqlite3";
+  return "application/octet-stream";
+}
+
 async function handleUpload(file) {
   els.uploadStatus.textContent = `Encrypting ${file.name}…`;
+  const type = guessType(file);
   const fileBytes = new Uint8Array(await file.arrayBuffer());
-  const envelope = packEnvelope({ name: file.name, type: file.type || "application/octet-stream" }, fileBytes);
+  const envelope = packEnvelope({ name: file.name, type }, fileBytes);
   const encrypted = await encryptBuffer(envelope, currentSession.key);
 
   const id = crypto.randomUUID();
@@ -210,7 +222,7 @@ async function handleUpload(file) {
     message: `store: ${file.name}`,
   });
 
-  const entry = { id, name: file.name, type: file.type || "application/octet-stream", size: file.size, uploadedAt: new Date().toISOString() };
+  const entry = { id, name: file.name, type, size: file.size, uploadedAt: new Date().toISOString() };
   els.uploadStatus.textContent = "Updating index…";
   const nextEntries = [...currentEntries, entry];
   await saveManifest(currentSession, nextEntries, currentManifestSha);
@@ -249,10 +261,12 @@ async function downloadEntry(entry) {
   URL.revokeObjectURL(url);
 }
 
-// Tracks the last object URL shown in the preview modal so it can be
-// revoked when replaced or closed - otherwise each preview leaks memory
-// for as long as the page stays open.
+// Tracks the last object URL / open sql.js Database shown in the preview
+// modal so both can be released when replaced or closed - otherwise each
+// preview leaks memory (an object URL, or WASM-heap memory for a SQLite
+// DB) for as long as the page stays open.
 let previewObjectUrl = null;
+let previewSqliteDb = null;
 
 function closePreview() {
   els.previewModal.classList.add("hidden");
@@ -260,6 +274,10 @@ function closePreview() {
   if (previewObjectUrl) {
     URL.revokeObjectURL(previewObjectUrl);
     previewObjectUrl = null;
+  }
+  if (previewSqliteDb) {
+    previewSqliteDb.close();
+    previewSqliteDb = null;
   }
 }
 
@@ -273,6 +291,11 @@ async function previewEntry(entry) {
     fileBytes = await fetchEntryBytes(entry);
   } catch (err) {
     els.previewBody.innerHTML = `<p class="error">${err.message}</p>`;
+    return;
+  }
+
+  if (isSqliteFile(entry)) {
+    previewSqliteDb = await renderSqlitePreview(fileBytes, els.previewBody);
     return;
   }
 

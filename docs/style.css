@@ -134,6 +134,44 @@ button.danger { border-color: color-mix(in srgb, red 40%, var(--border)); }
 
 .empty { color: var(--muted); padding: 0.6rem 0; list-style: none; grid-column: 1 / -1; }
 
+.sqlite-preview {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  align-items: stretch;
+}
+
+.sqlite-toolbar {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.sqlite-toolbar select, .sqlite-toolbar input {
+  padding: 0.4rem 0.5rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: inherit;
+  font-size: 0.85rem;
+}
+
+.sqlite-toolbar input { flex: 1; min-width: 160px; }
+
+.sqlite-results { overflow: auto; max-height: 55vh; }
+
+.sqlite-results table { border-collapse: collapse; width: 100%; font-size: 0.82rem; }
+
+.sqlite-results th, .sqlite-results td {
+  border: 1px solid var(--border);
+  padding: 0.3rem 0.5rem;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.sqlite-results th { background: color-mix(in srgb, currentColor 6%, transparent); }
+
 .preview-modal {
   position: fixed;
   inset: 0;
