@@ -156,18 +156,21 @@ export async function renderSqlitePreview(bytes, container, { onSave } = {}) {
     }
   }
 
-  // Matches the statement keywords that change data or schema - used to
-  // decide whether a query should trigger an automatic save. Deliberately
-  // keyword-based rather than checking db.getRowsModified(): that would
-  // miss schema changes (CREATE/DROP/ALTER) that affect zero rows but
-  // still need persisting.
-  const WRITE_STATEMENT = /^\s*(insert|update|delete|create|drop|alter|replace)\b/i;
+  // Matches statements that change schema - CREATE/DROP/ALTER affect zero
+  // rows, so db.getRowsModified() alone would miss them.
+  const SCHEMA_STATEMENT = /^\s*(create|drop|alter)\b/i;
 
   function runQuery(sql) {
     if (!sql.trim()) return;
     try {
       renderResult(db.exec(sql)[0]);
-      if (onSave && WRITE_STATEMENT.test(sql)) performSave(); // fire-and-forget - status shown via saveStatus
+      // Two independent checks, because neither alone covers everything:
+      // rowsModified catches INSERT/UPDATE/DELETE *however they're
+      // wrapped* (e.g. a leading WITH RECURSIVE ... CTE means the
+      // statement doesn't start with "insert" at all), while the keyword
+      // check catches CREATE/DROP/ALTER, which change nothing rows-wise.
+      const isWrite = db.getRowsModified() > 0 || SCHEMA_STATEMENT.test(sql);
+      if (onSave && isWrite) performSave(); // fire-and-forget - status shown via saveStatus
     } catch (err) {
       resultsEl.innerHTML = `<p class="error">${err.message}</p>`;
     }
