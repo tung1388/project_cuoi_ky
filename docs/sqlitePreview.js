@@ -99,27 +99,30 @@ export async function renderSqlitePreview(bytes, container, { onSave } = {}) {
 
   toolbar.append(select, queryInput, runBtn);
 
+  let saveBtn, saveStatus, performSave;
   if (onSave) {
-    const saveBtn = document.createElement("button");
-    saveBtn.textContent = "Save changes";
-    const saveStatus = document.createElement("span");
+    saveBtn = document.createElement("button");
+    saveBtn.textContent = "Save now";
+    saveStatus = document.createElement("span");
     saveStatus.className = "hint";
-    saveBtn.onclick = async () => {
+
+    performSave = async () => {
       saveBtn.disabled = true;
       saveStatus.textContent = "Saving…";
       try {
         // db.export() serializes the CURRENT in-memory state (including
-        // any INSERT/UPDATE/DELETE run via the query box above) back to
-        // bytes - that's the only way changes here become more than a
-        // demo, since sql.js otherwise only ever edits an in-memory copy.
+        // any INSERT/UPDATE/DELETE just run) back to bytes - that's the
+        // only way changes here become more than a demo, since sql.js
+        // otherwise only ever edits an in-memory copy.
         await onSave(db.export());
-        saveStatus.textContent = "Saved.";
+        saveStatus.textContent = `Auto-saved at ${new Date().toLocaleTimeString()}.`;
       } catch (err) {
         saveStatus.textContent = `Save failed: ${err.message}`;
       } finally {
         saveBtn.disabled = false;
       }
     };
+    saveBtn.onclick = performSave;
     toolbar.append(saveBtn, saveStatus);
   }
 
@@ -159,10 +162,18 @@ export async function renderSqlitePreview(bytes, container, { onSave } = {}) {
     }
   }
 
+  // Matches the statement keywords that change data or schema - used to
+  // decide whether a query should trigger an automatic save. Deliberately
+  // keyword-based rather than checking db.getRowsModified(): that would
+  // miss schema changes (CREATE/DROP/ALTER) that affect zero rows but
+  // still need persisting.
+  const WRITE_STATEMENT = /^\s*(insert|update|delete|create|drop|alter|replace)\b/i;
+
   function runQuery(sql) {
     if (!sql.trim()) return;
     try {
       renderResult(db.exec(sql)[0]);
+      if (onSave && WRITE_STATEMENT.test(sql)) performSave(); // fire-and-forget - status shown via saveStatus
     } catch (err) {
       resultsEl.innerHTML = `<p class="error">${err.message}</p>`;
     }
