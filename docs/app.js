@@ -22,6 +22,11 @@
 // at once could race and clobber each other's entry - acceptable at
 // "one person using their own account from their own browser" scale,
 // not something this prototype tries to solve properly.
+//
+// The "public" folder (see PUBLIC_FOLDER/PUBLIC_KEY below) is the one
+// exception to "your folder needs your password": it's readable by any
+// visitor with no login, using a fixed key shipped in this file instead
+// of a per-user password.
 // =====================================================================
 
 import { encryptBuffer, decryptBuffer, packEnvelope, unpackEnvelope } from "./crypto.js";
@@ -30,8 +35,16 @@ import { isSqliteFile, renderSqlitePreview } from "./sqlitePreview.js";
 
 const OWNER = "tung1388";
 const REPO = "project_cuoi_ky";
-
 const STORAGE_KEY = "githost.session";
+
+const PUBLIC_FOLDER = "public";
+// Not a real secret - it's shipped in this client file so the page can
+// auto-decrypt the public folder for every visitor with no login. It
+// keeps blobs/public/*.enc unreadable when browsing the repo/GitHub UI
+// directly; anyone who reads this file can derive it too, same tradeoff
+// as any client-side-only encryption scheme (see pat.enc for the private
+// folders' equivalent, gated behind a password instead).
+const PUBLIC_KEY = "githost-public-folder-shared-key-v1";
 
 const els = {
   loginForm: document.getElementById("login-form"),
@@ -46,6 +59,11 @@ const els = {
   uploadStatus: document.getElementById("upload-status"),
   fileList: document.getElementById("file-list"),
   refreshBtn: document.getElementById("refresh-btn"),
+  publicFileList: document.getElementById("public-file-list"),
+  publicRefreshBtn: document.getElementById("public-refresh-btn"),
+  publicUploadRow: document.getElementById("public-upload-row"),
+  publicFileInput: document.getElementById("public-file-input"),
+  publicUploadStatus: document.getElementById("public-upload-status"),
   previewModal: document.getElementById("preview-modal"),
   previewTitle: document.getElementById("preview-title"),
   previewBody: document.getElementById("preview-body"),
@@ -76,8 +94,17 @@ function blobPath(session, id) {
   return `blobs/${session.folder}/${id}.enc`;
 }
 
+// Authenticated reads use the normal token'd endpoint; a session with no
+// token (the public folder, viewed by a logged-out visitor) falls back to
+// GitHub's unauthenticated public-repo read instead.
+async function fetchFile(session, path) {
+  return session.token
+    ? getFile({ owner: session.owner, repo: session.repo, token: session.token, path })
+    : getPublicFile({ owner: session.owner, repo: session.repo, path });
+}
+
 async function loadManifest(session) {
-  const existing = await getFile({ ...session, path: manifestPath(session) });
+  const existing = await fetchFile(session, manifestPath(session));
   if (!existing) return { entries: [], sha: null };
   const decrypted = await decryptBuffer(existing.bytes, session.key);
   const entries = JSON.parse(new TextDecoder().decode(decrypted));
@@ -88,7 +115,9 @@ async function saveManifest(session, entries, sha) {
   const bytes = new TextEncoder().encode(JSON.stringify(entries));
   const encrypted = await encryptBuffer(bytes, session.key);
   await putFile({
-    ...session,
+    owner: session.owner,
+    repo: session.repo,
+    token: session.token,
     path: manifestPath(session),
     bytes: encrypted,
     message: `update manifest (${entries.length} files)`,
@@ -112,91 +141,6 @@ function iconFor(entry) {
   return TYPE_ICON[kind] || "📦";
 }
 
-// Object URLs created for auto-loaded image thumbnails - tracked so they
-// can all be revoked before the next render, otherwise every refresh
-// leaks the previous batch (Blob URLs aren't garbage-collected on their
-// own).
-let thumbnailObjectUrls = [];
-function revokeThumbnails() {
-  for (const url of thumbnailObjectUrls) URL.revokeObjectURL(url);
-  thumbnailObjectUrls = [];
-}
-
-async function loadThumbnail(entry, imgEl) {
-  try {
-    const fileBytes = await fetchEntryBytes(entry);
-    const url = URL.createObjectURL(new Blob([fileBytes], { type: entry.type }));
-    thumbnailObjectUrls.push(url);
-    imgEl.src = url;
-    imgEl.classList.remove("loading");
-  } catch {
-    imgEl.replaceWith(Object.assign(document.createElement("div"), { className: "file-icon", textContent: "⚠️" }));
-  }
-}
-
-function renderList(entries) {
-  revokeThumbnails();
-  els.fileList.innerHTML = "";
-  els.fileList.className = "file-grid";
-  if (entries.length === 0) {
-    els.fileList.innerHTML = '<li class="empty">No files yet.</li>';
-    return;
-  }
-  for (const entry of [...entries].reverse()) {
-    const li = document.createElement("li");
-    li.className = "file-tile";
-    li.title = `${entry.name} · ${formatBytes(entry.size)} · ${new Date(entry.uploadedAt).toLocaleString()}`;
-    li.onclick = () => previewEntry(entry);
-
-    const thumb = document.createElement("div");
-    thumb.className = "file-thumb";
-    if (entry.type?.startsWith("image/")) {
-      const img = document.createElement("img");
-      img.className = "loading";
-      img.alt = entry.name;
-      thumb.appendChild(img);
-      loadThumbnail(entry, img); // fire-and-forget - fills in once decrypted
-    } else {
-      const icon = document.createElement("div");
-      icon.className = "file-icon";
-      icon.textContent = iconFor(entry);
-      thumb.appendChild(icon);
-    }
-
-    const name = document.createElement("span");
-    name.className = "file-tile-name";
-    name.textContent = entry.name;
-
-    const actions = document.createElement("div");
-    actions.className = "file-tile-actions";
-    const downloadBtn = document.createElement("button");
-    downloadBtn.textContent = "⭳";
-    downloadBtn.title = "Download";
-    downloadBtn.onclick = (e) => { e.stopPropagation(); downloadEntry(entry); };
-    const deleteBtn = document.createElement("button");
-    deleteBtn.textContent = "✕";
-    deleteBtn.title = "Remove";
-    deleteBtn.className = "danger";
-    deleteBtn.onclick = (e) => { e.stopPropagation(); removeEntry(entry.id); };
-    actions.append(downloadBtn, deleteBtn);
-
-    li.append(thumb, name, actions);
-    els.fileList.appendChild(li);
-  }
-}
-
-let currentSession = null;
-let currentEntries = [];
-let currentManifestSha = null;
-
-async function refresh() {
-  els.fileList.innerHTML = '<li class="empty">Loading…</li>';
-  const { entries, sha } = await loadManifest(currentSession);
-  currentEntries = entries;
-  currentManifestSha = sha;
-  renderList(entries);
-}
-
 // Browsers generally don't recognize .sqlite/.db as a MIME type, so
 // file.type comes back as "" for them - fall back to the extension so
 // the manifest still records a type the preview can recognize later.
@@ -206,48 +150,21 @@ function guessType(file) {
   return "application/octet-stream";
 }
 
-async function handleUpload(file) {
-  els.uploadStatus.textContent = `Encrypting ${file.name}…`;
-  const type = guessType(file);
-  const fileBytes = new Uint8Array(await file.arrayBuffer());
-  const envelope = packEnvelope({ name: file.name, type }, fileBytes);
-  const encrypted = await encryptBuffer(envelope, currentSession.key);
-
-  const id = crypto.randomUUID();
-  els.uploadStatus.textContent = `Uploading ${file.name}…`;
-  await putFile({
-    ...currentSession,
-    path: blobPath(currentSession, id),
-    bytes: encrypted,
-    message: `store: ${file.name}`,
-  });
-
-  const entry = { id, name: file.name, type, size: file.size, uploadedAt: new Date().toISOString() };
-  els.uploadStatus.textContent = "Updating index…";
-  const nextEntries = [...currentEntries, entry];
-  await saveManifest(currentSession, nextEntries, currentManifestSha);
-  currentEntries = nextEntries;
-  currentManifestSha = null; // stale after the write above; refresh() re-fetches it if needed
-
-  els.uploadStatus.textContent = `Done: ${file.name}`;
-  renderList(currentEntries);
-}
-
 // Fetch + decrypt + unpack an uploaded entry - shared by download and
 // preview, which only differ in what they do with the resulting bytes.
-async function fetchEntryBytes(entry) {
-  const stored = await getFile({ ...currentSession, path: blobPath(currentSession, entry.id) });
+async function fetchEntryBytes(session, entry) {
+  const stored = await fetchFile(session, blobPath(session, entry.id));
   if (!stored) {
     throw new Error(`${entry.name} is missing from the repo (was it deleted outside this app?).`);
   }
-  const decrypted = await decryptBuffer(stored.bytes, currentSession.key);
+  const decrypted = await decryptBuffer(stored.bytes, session.key);
   return unpackEnvelope(decrypted).fileBytes;
 }
 
-async function downloadEntry(entry) {
+async function downloadEntry(session, entry) {
   let fileBytes;
   try {
-    fileBytes = await fetchEntryBytes(entry);
+    fileBytes = await fetchEntryBytes(session, entry);
   } catch (err) {
     alert(err.message);
     return;
@@ -281,14 +198,17 @@ function closePreview() {
   }
 }
 
-async function previewEntry(entry) {
+// `onEdited` is called after a successful in-place SQLite save so the
+// gallery that opened this preview can re-render; omitted (read-only
+// session, e.g. an anonymous visitor on the public folder) disables saving.
+async function previewEntry(session, entry, onEdited) {
   els.previewTitle.textContent = entry.name;
   els.previewBody.innerHTML = '<p class="hint">Decrypting…</p>';
   els.previewModal.classList.remove("hidden");
 
   let fileBytes;
   try {
-    fileBytes = await fetchEntryBytes(entry);
+    fileBytes = await fetchEntryBytes(session, entry);
   } catch (err) {
     els.previewBody.innerHTML = `<p class="error">${err.message}</p>`;
     return;
@@ -296,23 +216,25 @@ async function previewEntry(entry) {
 
   if (isSqliteFile(entry)) {
     previewSqliteDb = await renderSqlitePreview(fileBytes, els.previewBody, {
-      onSave: async (newDbBytes) => {
-        // Same overwrite pattern as any other edit: re-fetch the blob's
-        // current sha right before writing (not the one from when the
-        // preview opened) so a concurrent change elsewhere isn't clobbered
-        // blind, then update the manifest entry's size/uploadedAt in place.
-        const path = blobPath(currentSession, entry.id);
-        const current = await getFile({ ...currentSession, path });
-        const envelope = packEnvelope({ name: entry.name, type: entry.type }, newDbBytes);
-        const encrypted = await encryptBuffer(envelope, currentSession.key);
-        await putFile({ ...currentSession, path, bytes: encrypted, message: `edit: ${entry.name}`, sha: current?.sha });
+      onSave: session.token
+        ? async (newDbBytes) => {
+            // Same overwrite pattern as any other edit: re-fetch the blob's
+            // current sha right before writing (not the one from when the
+            // preview opened) so a concurrent change elsewhere isn't
+            // clobbered blind, then update the manifest entry in place.
+            const path = blobPath(session, entry.id);
+            const current = await getFile({ owner: session.owner, repo: session.repo, token: session.token, path });
+            const envelope = packEnvelope({ name: entry.name, type: entry.type }, newDbBytes);
+            const encrypted = await encryptBuffer(envelope, session.key);
+            await putFile({ owner: session.owner, repo: session.repo, token: session.token, path, bytes: encrypted, message: `edit: ${entry.name}`, sha: current?.sha });
 
-        entry.size = newDbBytes.length;
-        entry.uploadedAt = new Date().toISOString();
-        const { sha: manifestSha } = await loadManifest(currentSession);
-        await saveManifest(currentSession, currentEntries, manifestSha);
-        renderList(currentEntries);
-      },
+            const { entries: freshEntries, sha: manifestSha } = await loadManifest(session);
+            const idx = freshEntries.findIndex((e) => e.id === entry.id);
+            if (idx !== -1) freshEntries[idx] = { ...freshEntries[idx], size: newDbBytes.length, uploadedAt: new Date().toISOString() };
+            await saveManifest(session, freshEntries, manifestSha);
+            onEdited?.();
+          }
+        : undefined,
     });
     return;
   }
@@ -347,25 +269,166 @@ async function previewEntry(entry) {
   els.previewBody.appendChild(el);
 }
 
-async function removeEntry(id) {
-  // Removes the entry from the index only - the encrypted blob itself
-  // stays in git history (git doesn't cheaply "forget" old commits).
-  // Good enough for "stop showing it in the list"; not a real delete.
-  if (!confirm("Remove this from your file list? (The underlying git history isn't erased.)")) return;
-  const nextEntries = currentEntries.filter((e) => e.id !== id);
-  const { sha } = await loadManifest(currentSession); // re-fetch sha to avoid a stale write
-  await saveManifest(currentSession, nextEntries, sha);
-  currentEntries = nextEntries;
-  renderList(currentEntries);
+// One gallery = one folder's worth of upload/list/preview/delete state.
+// Used twice: once for the logged-in user's own private folder, once for
+// the shared "public" folder (readable/writable by anyone, but writable
+// only once `getSession()` carries a token, i.e. someone is logged in).
+function createGallery({ listEl, getSession, canManage }) {
+  let entries = [];
+  let manifestSha = null;
+  let thumbnailObjectUrls = [];
+
+  function revokeThumbnails() {
+    for (const url of thumbnailObjectUrls) URL.revokeObjectURL(url);
+    thumbnailObjectUrls = [];
+  }
+
+  async function loadThumbnail(entry, imgEl) {
+    try {
+      const fileBytes = await fetchEntryBytes(getSession(), entry);
+      const url = URL.createObjectURL(new Blob([fileBytes], { type: entry.type }));
+      thumbnailObjectUrls.push(url);
+      imgEl.src = url;
+      imgEl.classList.remove("loading");
+    } catch {
+      imgEl.replaceWith(Object.assign(document.createElement("div"), { className: "file-icon", textContent: "⚠️" }));
+    }
+  }
+
+  function render() {
+    revokeThumbnails();
+    listEl.innerHTML = "";
+    listEl.className = "file-grid";
+    if (entries.length === 0) {
+      listEl.innerHTML = '<li class="empty">No files yet.</li>';
+      return;
+    }
+    for (const entry of [...entries].reverse()) {
+      const li = document.createElement("li");
+      li.className = "file-tile";
+      li.title = `${entry.name} · ${formatBytes(entry.size)} · ${new Date(entry.uploadedAt).toLocaleString()}`;
+      li.onclick = () => previewEntry(getSession(), entry, canManage() ? render : undefined);
+
+      const thumb = document.createElement("div");
+      thumb.className = "file-thumb";
+      if (entry.type?.startsWith("image/")) {
+        const img = document.createElement("img");
+        img.className = "loading";
+        img.alt = entry.name;
+        thumb.appendChild(img);
+        loadThumbnail(entry, img); // fire-and-forget - fills in once decrypted
+      } else {
+        const icon = document.createElement("div");
+        icon.className = "file-icon";
+        icon.textContent = iconFor(entry);
+        thumb.appendChild(icon);
+      }
+
+      const name = document.createElement("span");
+      name.className = "file-tile-name";
+      name.textContent = entry.name;
+
+      const actions = document.createElement("div");
+      actions.className = "file-tile-actions";
+      const downloadBtn = document.createElement("button");
+      downloadBtn.textContent = "⭳";
+      downloadBtn.title = "Download";
+      downloadBtn.onclick = (e) => { e.stopPropagation(); downloadEntry(getSession(), entry); };
+      actions.append(downloadBtn);
+      if (canManage()) {
+        const deleteBtn = document.createElement("button");
+        deleteBtn.textContent = "✕";
+        deleteBtn.title = "Remove";
+        deleteBtn.className = "danger";
+        deleteBtn.onclick = (e) => { e.stopPropagation(); removeEntry(entry.id); };
+        actions.append(deleteBtn);
+      }
+
+      li.append(thumb, name, actions);
+      listEl.appendChild(li);
+    }
+  }
+
+  async function refresh() {
+    listEl.innerHTML = '<li class="empty">Loading…</li>';
+    const result = await loadManifest(getSession());
+    entries = result.entries;
+    manifestSha = result.sha;
+    render();
+  }
+
+  async function upload(file, statusEl) {
+    const session = getSession();
+    statusEl.textContent = `Encrypting ${file.name}…`;
+    const type = guessType(file);
+    const fileBytes = new Uint8Array(await file.arrayBuffer());
+    const envelope = packEnvelope({ name: file.name, type }, fileBytes);
+    const encrypted = await encryptBuffer(envelope, session.key);
+
+    const id = crypto.randomUUID();
+    statusEl.textContent = `Uploading ${file.name}…`;
+    await putFile({ owner: session.owner, repo: session.repo, token: session.token, path: blobPath(session, id), bytes: encrypted, message: `store: ${file.name}` });
+
+    const entry = { id, name: file.name, type, size: file.size, uploadedAt: new Date().toISOString() };
+    statusEl.textContent = "Updating index…";
+    const nextEntries = [...entries, entry];
+    await saveManifest(session, nextEntries, manifestSha);
+    entries = nextEntries;
+    manifestSha = null; // stale after the write above; refresh() re-fetches it if needed
+
+    statusEl.textContent = `Done: ${file.name}`;
+    render();
+  }
+
+  async function removeEntry(id) {
+    // Removes the entry from the index only - the encrypted blob itself
+    // stays in git history (git doesn't cheaply "forget" old commits).
+    // Good enough for "stop showing it in the list"; not a real delete.
+    if (!confirm("Remove this from your file list? (The underlying git history isn't erased.)")) return;
+    const session = getSession();
+    const nextEntries = entries.filter((e) => e.id !== id);
+    const { sha } = await loadManifest(session); // re-fetch sha to avoid a stale write
+    await saveManifest(session, nextEntries, sha);
+    entries = nextEntries;
+    render();
+  }
+
+  return { refresh, upload };
 }
+
+let currentSession = null;
+
+const privateGallery = createGallery({
+  listEl: els.fileList,
+  getSession: () => currentSession,
+  canManage: () => true,
+});
+
+function publicSession() {
+  // Reuses whatever GitHub token the logged-in user has (writes need
+  // auth); with no one logged in, token is undefined and reads fall back
+  // to the unauthenticated public endpoint (see fetchFile).
+  return { owner: OWNER, repo: REPO, token: currentSession?.token, folder: PUBLIC_FOLDER, key: PUBLIC_KEY };
+}
+
+const publicGallery = createGallery({
+  listEl: els.publicFileList,
+  getSession: publicSession,
+  canManage: () => !!currentSession,
+});
 
 function showApp(session) {
   currentSession = session;
   els.loginForm.classList.add("hidden");
   els.app.classList.remove("hidden");
   els.whoami.textContent = `Logged in as ${session.folder}`;
-  refresh().catch((err) => {
+  els.publicUploadRow.classList.remove("hidden");
+  privateGallery.refresh().catch((err) => {
     els.fileList.innerHTML = `<li class="empty error">Failed to load: ${err.message}</li>`;
+  });
+  // Re-run with the now-available token, mainly so delete buttons show up.
+  publicGallery.refresh().catch((err) => {
+    els.publicFileList.innerHTML = `<li class="empty error">Failed to load: ${err.message}</li>`;
   });
 }
 
@@ -422,10 +485,14 @@ els.logoutBtn.addEventListener("click", () => {
   currentSession = null;
   els.app.classList.add("hidden");
   els.loginForm.classList.remove("hidden");
+  els.publicUploadRow.classList.add("hidden");
+  publicGallery.refresh().catch((err) => {
+    els.publicFileList.innerHTML = `<li class="empty error">Failed to load: ${err.message}</li>`;
+  });
 });
 
 els.refreshBtn.addEventListener("click", () => {
-  refresh().catch((err) => alert(`Refresh failed: ${err.message}`));
+  privateGallery.refresh().catch((err) => alert(`Refresh failed: ${err.message}`));
 });
 
 els.fileInput.addEventListener("change", async () => {
@@ -433,9 +500,24 @@ els.fileInput.addEventListener("change", async () => {
   els.fileInput.value = "";
   if (!file) return;
   try {
-    await handleUpload(file);
+    await privateGallery.upload(file, els.uploadStatus);
   } catch (err) {
     els.uploadStatus.textContent = `Upload failed: ${err.message}`;
+  }
+});
+
+els.publicRefreshBtn.addEventListener("click", () => {
+  publicGallery.refresh().catch((err) => alert(`Refresh failed: ${err.message}`));
+});
+
+els.publicFileInput.addEventListener("change", async () => {
+  const file = els.publicFileInput.files[0];
+  els.publicFileInput.value = "";
+  if (!file) return;
+  try {
+    await publicGallery.upload(file, els.publicUploadStatus);
+  } catch (err) {
+    els.publicUploadStatus.textContent = `Upload failed: ${err.message}`;
   }
 });
 
@@ -448,4 +530,10 @@ document.addEventListener("keydown", (e) => {
 });
 
 const existingSession = loadSession();
-if (existingSession) showApp(existingSession);
+if (existingSession) {
+  showApp(existingSession);
+} else {
+  publicGallery.refresh().catch((err) => {
+    els.publicFileList.innerHTML = `<li class="empty error">Failed to load: ${err.message}</li>`;
+  });
+}
