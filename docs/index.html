@@ -27,22 +27,6 @@
       <p class="hint">No access token needed - your password unlocks a stored, encrypted one. Everything above is saved only in this browser's local storage.</p>
     </form>
 
-    <section id="public-section" class="card">
-      <div class="list-header">
-        <h2>Public files</h2>
-        <button id="public-refresh-btn" class="secondary">Refresh</button>
-      </div>
-      <div id="public-upload-row" class="upload-row hidden">
-        <label class="upload-btn">
-          Publish a file
-          <input id="public-file-input" type="file" class="hidden" />
-        </label>
-        <span id="public-upload-status"></span>
-      </div>
-      <ul id="public-file-list"></ul>
-      <p class="hint">Visible to everyone without logging in. Still stored encrypted - browsing the repo on GitHub directly won't show the contents.</p>
-    </section>
-
     <section id="app" class="card hidden">
       <div class="app-header">
         <span id="whoami"></span>
@@ -51,8 +35,12 @@
 
       <div class="upload-row">
         <label class="upload-btn">
-          Upload a file
-          <input id="file-input" type="file" class="hidden" />
+          Upload files
+          <input id="file-input" type="file" class="hidden" multiple />
+        </label>
+        <label class="upload-btn">
+          Upload a folder
+          <input id="folder-input" type="file" class="hidden" webkitdirectory multiple />
         </label>
         <span id="upload-status"></span>
       </div>
@@ -62,6 +50,26 @@
         <button id="refresh-btn" class="secondary">Refresh</button>
       </div>
       <ul id="file-list"></ul>
+    </section>
+
+    <section id="public-section" class="card">
+      <div class="list-header">
+        <h2>Public files</h2>
+        <button id="public-refresh-btn" class="secondary">Refresh</button>
+      </div>
+      <div id="public-upload-row" class="upload-row hidden">
+        <label class="upload-btn">
+          Publish files
+          <input id="public-file-input" type="file" class="hidden" multiple />
+        </label>
+        <label class="upload-btn">
+          Publish a folder
+          <input id="public-folder-input" type="file" class="hidden" webkitdirectory multiple />
+        </label>
+        <span id="public-upload-status"></span>
+      </div>
+      <ul id="public-file-list"></ul>
+      <p class="hint">Visible to everyone without logging in. Still stored encrypted - browsing the repo on GitHub directly won't show the contents.</p>
     </section>
   </main>
 

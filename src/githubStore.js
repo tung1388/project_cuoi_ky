@@ -32,6 +32,7 @@ import { encryptBuffer, decryptBuffer } from "./crypto.js";
 
 const GITHUB_API = "https://api.github.com";
 const JSDELIVR_RETRY_DELAYS_MS = [500, 1000, 2000]; // brand-new commits can take a moment to appear
+const RULE_TIMEOUT_RETRY_DELAYS_MS = [500, 1000, 2000]; // GitHub repo-ruleset validation occasionally times out transiently
 
 function githubHeaders(token) {
   return {
@@ -71,25 +72,36 @@ async function getExistingSha({ path, config }) {
 /** Shared PUT-encrypted-content-at-a-path core, used by uploadFile (random path, always new) and storePat (fixed path, may already exist). */
 async function putEncrypted({ encrypted, path, message, config, sha }) {
   const { token, owner, repo } = config;
-  const res = await fetch(
-    `${GITHUB_API}/repos/${owner}/${repo}/contents/${path}`,
-    {
+  const requestBody = JSON.stringify({
+    message,
+    content: encrypted.toString("base64"),
+    ...(sha ? { sha } : {}),
+  });
+
+  let data;
+  for (let attempt = 0; ; attempt += 1) {
+    const res = await fetch(`${GITHUB_API}/repos/${owner}/${repo}/contents/${path}`, {
       method: "PUT",
       headers: { ...githubHeaders(token), "Content-Type": "application/json" },
-      body: JSON.stringify({
-        message,
-        content: encrypted.toString("base64"),
-        ...(sha ? { sha } : {}),
-      }),
+      body: requestBody,
+    });
+    if (res.ok) {
+      data = await res.json();
+      break;
     }
-  );
 
-  if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`github upload failed: ${res.status} ${body.slice(0, 300)}`);
+    // GitHub repo rulesets occasionally time out validating a push and
+    // ask the caller to just retry - a transient server-side hiccup, safe
+    // to retry blindly (unlike a real sha-conflict 409, whose message is
+    // different and means "your write really did lose a race").
+    const isRuleTimeout = res.status === 409 && /timed out validating rule/i.test(body);
+    if (!isRuleTimeout || attempt >= RULE_TIMEOUT_RETRY_DELAYS_MS.length) {
+      throw new Error(`github upload failed: ${res.status} ${body.slice(0, 300)}`);
+    }
+    await sleep(RULE_TIMEOUT_RETRY_DELAYS_MS[attempt]);
   }
 
-  const data = await res.json();
   const commitSha = data.commit?.sha;
   if (!commitSha) {
     throw new Error("github upload failed: no commit sha in response");

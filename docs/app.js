@@ -56,6 +56,7 @@ const els = {
   whoami: document.getElementById("whoami"),
   logoutBtn: document.getElementById("logout-btn"),
   fileInput: document.getElementById("file-input"),
+  folderInput: document.getElementById("folder-input"),
   uploadStatus: document.getElementById("upload-status"),
   fileList: document.getElementById("file-list"),
   refreshBtn: document.getElementById("refresh-btn"),
@@ -63,6 +64,7 @@ const els = {
   publicRefreshBtn: document.getElementById("public-refresh-btn"),
   publicUploadRow: document.getElementById("public-upload-row"),
   publicFileInput: document.getElementById("public-file-input"),
+  publicFolderInput: document.getElementById("public-folder-input"),
   publicUploadStatus: document.getElementById("public-upload-status"),
   previewModal: document.getElementById("preview-modal"),
   previewTitle: document.getElementById("preview-title"),
@@ -357,26 +359,47 @@ function createGallery({ listEl, getSession, canManage }) {
     render();
   }
 
-  async function upload(file, statusEl) {
-    const session = getSession();
-    statusEl.textContent = `Encrypting ${file.name}…`;
+  // A folder input's files carry webkitRelativePath (e.g.
+  // "myfolder/sub/file.txt") - use that as the stored name when present so
+  // folder structure survives as part of the (encrypted) filename; a plain
+  // file picker leaves it "" and falls back to the bare name.
+  async function uploadOne(file, session) {
+    const name = file.webkitRelativePath || file.name;
     const type = guessType(file);
     const fileBytes = new Uint8Array(await file.arrayBuffer());
-    const envelope = packEnvelope({ name: file.name, type }, fileBytes);
+    const envelope = packEnvelope({ name, type }, fileBytes);
     const encrypted = await encryptBuffer(envelope, session.key);
 
     const id = crypto.randomUUID();
-    statusEl.textContent = `Uploading ${file.name}…`;
-    await putFile({ owner: session.owner, repo: session.repo, token: session.token, path: blobPath(session, id), bytes: encrypted, message: `store: ${file.name}` });
+    await putFile({ owner: session.owner, repo: session.repo, token: session.token, path: blobPath(session, id), bytes: encrypted, message: `store: ${name}` });
+    return { id, name, type, size: file.size, uploadedAt: new Date().toISOString() };
+  }
 
-    const entry = { id, name: file.name, type, size: file.size, uploadedAt: new Date().toISOString() };
+  // Accepts a FileList (or array) - uploads every blob sequentially (to
+  // stay within GitHub's rate limit and keep status messages readable),
+  // then writes the manifest exactly once at the end instead of once per
+  // file, so a batch upload doesn't need a fresh sha between every file.
+  async function upload(files, statusEl) {
+    const session = getSession();
+    const fileArray = Array.from(files);
+    const newEntries = [];
+    for (let i = 0; i < fileArray.length; i += 1) {
+      const file = fileArray[i];
+      const name = file.webkitRelativePath || file.name;
+      statusEl.textContent = fileArray.length > 1
+        ? `Uploading ${i + 1}/${fileArray.length}: ${name}…`
+        : `Uploading ${name}…`;
+      newEntries.push(await uploadOne(file, session));
+    }
+
     statusEl.textContent = "Updating index…";
-    const nextEntries = [...entries, entry];
-    await saveManifest(session, nextEntries, manifestSha);
+    const { entries: freshEntries, sha } = await loadManifest(session); // re-fetch sha to avoid a stale write
+    const nextEntries = [...freshEntries, ...newEntries];
+    await saveManifest(session, nextEntries, sha);
     entries = nextEntries;
     manifestSha = null; // stale after the write above; refresh() re-fetches it if needed
 
-    statusEl.textContent = `Done: ${file.name}`;
+    statusEl.textContent = fileArray.length > 1 ? `Done: ${fileArray.length} files.` : `Done: ${fileArray[0].name}`;
     render();
   }
 
@@ -495,31 +518,26 @@ els.refreshBtn.addEventListener("click", () => {
   privateGallery.refresh().catch((err) => alert(`Refresh failed: ${err.message}`));
 });
 
-els.fileInput.addEventListener("change", async () => {
-  const file = els.fileInput.files[0];
-  els.fileInput.value = "";
-  if (!file) return;
+async function handlePick(input, gallery, statusEl) {
+  const files = input.files;
+  input.value = "";
+  if (!files.length) return;
   try {
-    await privateGallery.upload(file, els.uploadStatus);
+    await gallery.upload(files, statusEl);
   } catch (err) {
-    els.uploadStatus.textContent = `Upload failed: ${err.message}`;
+    statusEl.textContent = `Upload failed: ${err.message}`;
   }
-});
+}
+
+els.fileInput.addEventListener("change", () => handlePick(els.fileInput, privateGallery, els.uploadStatus));
+els.folderInput.addEventListener("change", () => handlePick(els.folderInput, privateGallery, els.uploadStatus));
 
 els.publicRefreshBtn.addEventListener("click", () => {
   publicGallery.refresh().catch((err) => alert(`Refresh failed: ${err.message}`));
 });
 
-els.publicFileInput.addEventListener("change", async () => {
-  const file = els.publicFileInput.files[0];
-  els.publicFileInput.value = "";
-  if (!file) return;
-  try {
-    await publicGallery.upload(file, els.publicUploadStatus);
-  } catch (err) {
-    els.publicUploadStatus.textContent = `Upload failed: ${err.message}`;
-  }
-});
+els.publicFileInput.addEventListener("change", () => handlePick(els.publicFileInput, publicGallery, els.publicUploadStatus));
+els.publicFolderInput.addEventListener("change", () => handlePick(els.publicFolderInput, publicGallery, els.publicUploadStatus));
 
 els.previewClose.addEventListener("click", closePreview);
 els.previewModal.addEventListener("click", (e) => {

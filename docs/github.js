@@ -21,6 +21,11 @@
 // =====================================================================
 
 const API = "https://api.github.com";
+const RULE_TIMEOUT_RETRY_DELAYS_MS = [500, 1000, 2000]; // GitHub repo-ruleset validation occasionally times out transiently
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function headers(token) {
   return {
@@ -82,16 +87,32 @@ export async function getPublicFile({ owner, repo, path }) {
  * check, rejecting the write if the file has moved on since you read it.
  */
 export async function putFile({ owner, repo, token, path, bytes, message, sha }) {
-  const res = await fetch(`${API}/repos/${owner}/${repo}/contents/${encodeURI(path)}`, {
-    method: "PUT",
-    headers: { ...headers(token), "Content-Type": "application/json" },
-    body: JSON.stringify({
-      message,
-      content: bytesToBase64(bytes),
-      ...(sha ? { sha } : {}),
-    }),
+  const body = JSON.stringify({
+    message,
+    content: bytesToBase64(bytes),
+    ...(sha ? { sha } : {}),
   });
-  if (!res.ok) throw new Error(`github put failed: ${res.status} ${(await res.text()).slice(0, 300)}`);
-  const data = await res.json();
-  return { sha: data.content.sha, commit_sha: data.commit.sha };
+
+  for (let attempt = 0; ; attempt += 1) {
+    const res = await fetch(`${API}/repos/${owner}/${repo}/contents/${encodeURI(path)}`, {
+      method: "PUT",
+      headers: { ...headers(token), "Content-Type": "application/json" },
+      body,
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return { sha: data.content.sha, commit_sha: data.commit.sha };
+    }
+
+    const text = await res.text();
+    // GitHub repo rulesets occasionally time out validating a push and
+    // ask the caller to just retry - a transient server-side hiccup, safe
+    // to retry blindly (unlike a real sha-conflict 409, whose message is
+    // different and means "your write really did lose a race").
+    const isRuleTimeout = res.status === 409 && /timed out validating rule/i.test(text);
+    if (!isRuleTimeout || attempt >= RULE_TIMEOUT_RETRY_DELAYS_MS.length) {
+      throw new Error(`github put failed: ${res.status} ${text.slice(0, 300)}`);
+    }
+    await sleep(RULE_TIMEOUT_RETRY_DELAYS_MS[attempt]);
+  }
 }

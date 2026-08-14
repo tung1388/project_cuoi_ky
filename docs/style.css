@@ -65,6 +65,8 @@ button.danger { border-color: color-mix(in srgb, red 40%, var(--border)); }
   margin-bottom: 1rem;
 }
 
+.upload-row { flex-wrap: wrap; gap: 0.5rem; }
+
 .upload-btn {
   display: inline-block;
   padding: 0.5rem 1rem;
