@@ -62,9 +62,23 @@ function headers(token) {
   };
 }
 
+// Building the binary string one character at a time (`binary +=
+// String.fromCharCode(bytes[i])` in a loop) is ~19 million synchronous
+// operations for an 18MB chunk - the size used everywhere else in this
+// app - with zero opportunity for the browser to repaint in between. That
+// blocks the main thread for multiple seconds per chunk, which is what
+// "uploading/decrypting large files just gets stuck" actually was: not a
+// hung network request (already fixed separately), the tab genuinely
+// freezing on CPU-bound work with no yield point. String.fromCharCode.
+// apply() over blocks of the array is dramatically faster - one call per
+// 32KB block instead of one per byte - so the loop finishes in a small
+// fraction of the time.
+const BASE64_BLOCK_SIZE = 0x8000; // 32768 - comfortably under engines' apply()/spread argument-count ceiling
 function bytesToBase64(bytes) {
   let binary = "";
-  for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
+  for (let i = 0; i < bytes.length; i += BASE64_BLOCK_SIZE) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + BASE64_BLOCK_SIZE));
+  }
   return btoa(binary);
 }
 
