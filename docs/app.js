@@ -304,10 +304,10 @@ async function previewEntry(session, entry, onEdited) {
     els.previewBody.innerHTML = "";
     const notice = document.createElement("p");
     notice.className = "hint";
-    notice.textContent = `${formatBytes(entry.size)} is too large to preview inline without risking the tab freezing - use Download instead, or `;
+    notice.textContent = `${formatBytes(entry.size)} is too large `;
     const riskBtn = document.createElement("button");
-    riskBtn.className = "secondary";
-    riskBtn.textContent = "risk it";
+    riskBtn.className = "danger";
+    riskBtn.textContent = "Preview anyway";
     riskBtn.onclick = () => renderMedia();
     notice.appendChild(riskBtn);
     els.previewBody.appendChild(notice);
