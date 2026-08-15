@@ -32,7 +32,6 @@
 import { encryptBuffer, decryptBuffer, CHUNK_SIZE, splitIntoChunks } from "./crypto.js";
 import { getFile, putFile, getPublicFile, createBlob, commitBatch } from "./github.js";
 import { isSqliteFile, renderSqlitePreview } from "./sqlitePreview.js";
-import { renderPdfPreview } from "./pdfPreview.js";
 
 const OWNER = "tung1388";
 const REPO = "project_cuoi_ky";
@@ -252,14 +251,12 @@ async function downloadEntry(session, entry, onProgress) {
   URL.revokeObjectURL(url);
 }
 
-// Tracks the last object URL / open sql.js Database / open pdf.js
-// document shown in the preview modal so all three can be released when
-// replaced or closed - otherwise each preview leaks memory (an object
-// URL, or WASM/parsed-document heap memory) for as long as the page
-// stays open.
+// Tracks the last object URL / open sql.js Database shown in the preview
+// modal so both can be released when replaced or closed - otherwise each
+// preview leaks memory (an object URL, or WASM-heap memory for a SQLite
+// DB) for as long as the page stays open.
 let previewObjectUrl = null;
 let previewSqliteDb = null;
-let previewPdfDoc = null;
 
 function closePreview() {
   els.previewModal.classList.add("hidden");
@@ -271,10 +268,6 @@ function closePreview() {
   if (previewSqliteDb) {
     previewSqliteDb.close();
     previewSqliteDb = null;
-  }
-  if (previewPdfDoc) {
-    previewPdfDoc.destroy();
-    previewPdfDoc = null;
   }
 }
 
@@ -353,16 +346,7 @@ async function previewEntry(session, entry, onEdited) {
 
   renderMedia();
 
-  async function renderMedia() {
-    // PDFs go through pdf.js, one page at a time, instead of the native
-    // <iframe> PDF viewer - that's what actually made loading a big
-    // document freeze the tab (laying out every page up front), not
-    // network/decrypt speed. See pdfPreview.js.
-    if (entry.type === "application/pdf") {
-      previewPdfDoc = await renderPdfPreview(fileBytes, els.previewBody);
-      return;
-    }
-
+  function renderMedia() {
     const blob = new Blob([fileBytes], { type: entry.type });
     const url = URL.createObjectURL(blob);
     previewObjectUrl = url;
@@ -381,8 +365,8 @@ async function previewEntry(session, entry, onEdited) {
       el = document.createElement("audio");
       el.src = url;
       el.controls = true;
-    } else if (kind === "text") {
-      // Browsers render plain text natively inside an <iframe>.
+    } else if (entry.type === "application/pdf" || kind === "text") {
+      // Browsers render PDFs and plain text natively inside an <iframe>.
       el = document.createElement("iframe");
       el.src = url;
     } else {
