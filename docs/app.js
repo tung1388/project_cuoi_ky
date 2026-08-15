@@ -680,7 +680,13 @@ els.refreshBtn.addEventListener("click", () => {
 });
 
 async function handlePick(input, gallery, statusEl) {
-  const files = input.files;
+  // input.files is a LIVE FileList - clearing input.value clears that same
+  // object in place, so capturing it and then resetting value would empty
+  // this reference too (confirmed live: the resulting length check always
+  // saw 0, silently no-opping every upload with no error and no network
+  // call). Array.from() snapshots the files into a real array first, so
+  // resetting the input afterward doesn't touch them.
+  const files = Array.from(input.files);
   input.value = "";
   if (!files.length) return;
   try {
