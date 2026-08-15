@@ -62,28 +62,22 @@ export async function decryptBuffer(bytes, passphrase) {
   return new Uint8Array(plain);
 }
 
-// ---------------------------------------------------------------------
-// Envelope: a 4-byte big-endian length prefix + JSON metadata + the raw
-// file bytes, all encrypted together as one blob. This is what lets the
-// file browser show a real filename/type/size without a separate
-// unencrypted index that would leak that info to anyone browsing the
-// (necessarily public) repo.
-// ---------------------------------------------------------------------
+// Fixed-size chunking for large files. Two independent ceilings, not one:
+// the Contents/Git-Data blob APIs' base64-inflated request body chokes
+// well before git's own ~100MB blob cap, and separately (more strictly)
+// jsDelivr's GitHub-CDN mode hard-caps served files at ~20MB. 18MB clears
+// both with margin. Metadata (name/type) lives only in the manifest entry
+// now, not packed into each blob - a chunked file would otherwise need
+// the same JSON repeated on every chunk for no benefit, since the
+// manifest is already fully encrypted.
+export const CHUNK_SIZE = 18 * 1024 * 1024; // 18MB
 
-export function packEnvelope(meta, fileBytes) {
-  const metaBytes = new TextEncoder().encode(JSON.stringify(meta));
-  const out = new Uint8Array(4 + metaBytes.length + fileBytes.length);
-  new DataView(out.buffer).setUint32(0, metaBytes.length, false);
-  out.set(metaBytes, 4);
-  out.set(fileBytes, 4 + metaBytes.length);
-  return out;
-}
-
-export function unpackEnvelope(bytes) {
-  if (bytes.length < 4) throw new Error("Invalid envelope: too short for a length prefix.");
-  const metaLen = new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0, false);
-  const metaBytes = bytes.slice(4, 4 + metaLen);
-  const meta = JSON.parse(new TextDecoder().decode(metaBytes));
-  const fileBytes = bytes.slice(4 + metaLen);
-  return { meta, fileBytes };
+export function splitIntoChunks(bytes, chunkSize = CHUNK_SIZE) {
+  const chunks = [];
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    chunks.push(bytes.subarray(offset, offset + chunkSize));
+  }
+  // A zero-byte file still needs exactly one (empty) chunk to round-trip.
+  if (chunks.length === 0) chunks.push(bytes.subarray(0, 0));
+  return chunks;
 }

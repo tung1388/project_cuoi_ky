@@ -29,8 +29,8 @@
 // of a per-user password.
 // =====================================================================
 
-import { encryptBuffer, decryptBuffer, packEnvelope, unpackEnvelope } from "./crypto.js";
-import { getFile, putFile, getPublicFile } from "./github.js";
+import { encryptBuffer, decryptBuffer, CHUNK_SIZE, splitIntoChunks } from "./crypto.js";
+import { getFile, putFile, getPublicFile, createBlob, commitBatch } from "./github.js";
 import { isSqliteFile, renderSqlitePreview } from "./sqlitePreview.js";
 
 const OWNER = "tung1388";
@@ -45,6 +45,10 @@ const PUBLIC_FOLDER = "public";
 // as any client-side-only encryption scheme (see pat.enc for the private
 // folders' equivalent, gated behind a password instead).
 const PUBLIC_KEY = "githost-public-folder-shared-key-v1";
+
+const CHUNK_UPLOAD_CONCURRENCY = 4; // chunks within one big file
+const FILE_UPLOAD_CONCURRENCY = 8; // whole files within one batch upload - blob creation only, no commit contention
+const COMMIT_BATCH_SIZE = 50; // files per commit - keeps each commit's tree small and bounds how much uncommitted work a crash mid-batch loses
 
 const els = {
   loginForm: document.getElementById("login-form"),
@@ -94,6 +98,26 @@ function manifestPath(session) {
 
 function blobPath(session, id) {
   return `blobs/${session.folder}/${id}.enc`;
+}
+
+function chunkPath(session, id, index) {
+  return `blobs/${session.folder}/${id}/${index}.enc`;
+}
+
+// Runs `worker` over `items` with at most `limit` in flight at once - no
+// dependency needed for a pool this small. Mirrors src/githubStore.js's
+// runWithConcurrency (the Node CLI side).
+async function runWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function runNext() {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await worker(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, runNext));
+  return results;
 }
 
 // Authenticated reads use the normal token'd endpoint; a session with no
@@ -152,15 +176,35 @@ function guessType(file) {
   return "application/octet-stream";
 }
 
-// Fetch + decrypt + unpack an uploaded entry - shared by download and
-// preview, which only differ in what they do with the resulting bytes.
+// Fetch + decrypt an uploaded entry - shared by download and preview,
+// which only differ in what they do with the resulting bytes. A chunked
+// entry (see createBlobsForFile) fetches+decrypts every chunk in parallel
+// and reassembles them in order; name/type/size all live on the manifest
+// entry itself, so there's no per-blob envelope to unpack.
 async function fetchEntryBytes(session, entry) {
+  if (entry.chunked) {
+    const chunks = await Promise.all(
+      Array.from({ length: entry.chunkCount }, async (_, index) => {
+        const stored = await fetchFile(session, chunkPath(session, entry.id, index));
+        if (!stored) throw new Error(`${entry.name} is missing chunk ${index} (was it deleted outside this app?).`);
+        return decryptBuffer(stored.bytes, session.key);
+      })
+    );
+    const total = chunks.reduce((sum, c) => sum + c.length, 0);
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return out;
+  }
+
   const stored = await fetchFile(session, blobPath(session, entry.id));
   if (!stored) {
     throw new Error(`${entry.name} is missing from the repo (was it deleted outside this app?).`);
   }
-  const decrypted = await decryptBuffer(stored.bytes, session.key);
-  return unpackEnvelope(decrypted).fileBytes;
+  return decryptBuffer(stored.bytes, session.key);
 }
 
 async function downloadEntry(session, entry) {
@@ -218,17 +262,19 @@ async function previewEntry(session, entry, onEdited) {
 
   if (isSqliteFile(entry)) {
     previewSqliteDb = await renderSqlitePreview(fileBytes, els.previewBody, {
-      onSave: session.token
+      // Chunked entries aren't editable in place here - that would need
+      // the same re-chunk-and-batch-commit machinery as a fresh upload,
+      // not worth it for the in-browser SQLite editor. Small (single-blob)
+      // entries still use the simple single-file overwrite pattern.
+      onSave: session.token && !entry.chunked
         ? async (newDbBytes) => {
-            // Same overwrite pattern as any other edit: re-fetch the blob's
-            // current sha right before writing (not the one from when the
-            // preview opened) so a concurrent change elsewhere isn't
-            // clobbered blind, then update the manifest entry in place.
+            // Re-fetch the blob's current sha right before writing (not
+            // the one from when the preview opened) so a concurrent
+            // change elsewhere isn't clobbered blind.
             const path = blobPath(session, entry.id);
             const current = await getFile({ owner: session.owner, repo: session.repo, token: session.token, path });
-            const envelope = packEnvelope({ name: entry.name, type: entry.type }, newDbBytes);
-            const encrypted = await encryptBuffer(envelope, session.key);
-            await putFile({ owner: session.owner, repo: session.repo, token: session.token, path, bytes: encrypted, message: `edit: ${entry.name}`, sha: current?.sha });
+            const encrypted = await encryptBuffer(newDbBytes, session.key);
+            await putFile({ owner: session.owner, repo: session.repo, token: session.token, path, bytes: encrypted, message: "edit: blob", sha: current?.sha });
 
             const { entries: freshEntries, sha: manifestSha } = await loadManifest(session);
             const idx = freshEntries.findIndex((e) => e.id === entry.id);
@@ -277,7 +323,6 @@ async function previewEntry(session, entry, onEdited) {
 // only once `getSession()` carries a token, i.e. someone is logged in).
 function createGallery({ listEl, getSession, canManage }) {
   let entries = [];
-  let manifestSha = null;
   let thumbnailObjectUrls = [];
 
   function revokeThumbnails() {
@@ -355,52 +400,142 @@ function createGallery({ listEl, getSession, canManage }) {
     listEl.innerHTML = '<li class="empty">Loading…</li>';
     const result = await loadManifest(getSession());
     entries = result.entries;
-    manifestSha = result.sha;
     render();
   }
 
-  // A folder input's files carry webkitRelativePath (e.g.
-  // "myfolder/sub/file.txt") - use that as the stored name when present so
-  // folder structure survives as part of the (encrypted) filename; a plain
-  // file picker leaves it "" and falls back to the bare name.
-  async function uploadOne(file, session) {
+  // Creates every blob a single file needs (one if it fits under
+  // CHUNK_SIZE, one per chunk otherwise) WITHOUT committing anything - the
+  // caller batches these across many files into one commit. A folder
+  // input's files carry webkitRelativePath (e.g. "myfolder/sub/file.txt")
+  // - used as the stored name when present so folder structure survives
+  // as part of the (encrypted) filename; a plain file picker leaves it ""
+  // and falls back to the bare name.
+  async function createBlobsForFile(file, session, onStatus) {
     const name = file.webkitRelativePath || file.name;
     const type = guessType(file);
     const fileBytes = new Uint8Array(await file.arrayBuffer());
-    const envelope = packEnvelope({ name, type }, fileBytes);
-    const encrypted = await encryptBuffer(envelope, session.key);
-
     const id = crypto.randomUUID();
-    await putFile({ owner: session.owner, repo: session.repo, token: session.token, path: blobPath(session, id), bytes: encrypted, message: `store: ${name}` });
-    return { id, name, type, size: file.size, uploadedAt: new Date().toISOString() };
+
+    if (fileBytes.length <= CHUNK_SIZE) {
+      onStatus?.(`Encrypting ${name}…`);
+      const encrypted = await encryptBuffer(fileBytes, session.key);
+      const blobSha = await createBlob({ owner: session.owner, repo: session.repo, token: session.token, bytes: encrypted });
+      return {
+        manifestEntry: { id, name, type, size: file.size, uploadedAt: new Date().toISOString() },
+        blobEntries: [{ path: blobPath(session, id), blobSha }],
+      };
+    }
+
+    const chunks = splitIntoChunks(fileBytes);
+    let uploaded = 0;
+    const blobShas = await runWithConcurrency(chunks, CHUNK_UPLOAD_CONCURRENCY, async (chunk) => {
+      const encrypted = await encryptBuffer(chunk, session.key);
+      const sha = await createBlob({ owner: session.owner, repo: session.repo, token: session.token, bytes: encrypted });
+      uploaded += 1;
+      onStatus?.(`Uploading ${name}… (${uploaded}/${chunks.length} chunks)`);
+      return sha;
+    });
+    const blobEntries = blobShas.map((blobSha, index) => ({ path: chunkPath(session, id, index), blobSha }));
+    return {
+      manifestEntry: { id, name, type, size: file.size, uploadedAt: new Date().toISOString(), chunked: true, chunkCount: chunks.length },
+      blobEntries,
+    };
   }
 
-  // Accepts a FileList (or array) - uploads every blob sequentially (to
-  // stay within GitHub's rate limit and keep status messages readable),
-  // then writes the manifest exactly once at the end instead of once per
-  // file, so a batch upload doesn't need a fresh sha between every file.
+  // Batches many already-created blobs into ONE commit that ALSO updates
+  // the manifest, via the Git Data API (see commitBatch in github.js). The
+  // manifest is re-read fresh inside buildEntries - called again on every
+  // retry - so a concurrent external write to it (another tab, the CLI)
+  // doesn't get silently clobbered even under a genuine conflict.
+  async function commitFilesToManifest(session, blobEntries, newManifestEntries, message) {
+    return commitBatch({
+      owner: session.owner,
+      repo: session.repo,
+      token: session.token,
+      message,
+      buildEntries: async () => {
+        const { entries: existing } = await loadManifest(session);
+        const merged = [...existing, ...newManifestEntries];
+        const manifestBytes = new TextEncoder().encode(JSON.stringify(merged));
+        const manifestEncrypted = await encryptBuffer(manifestBytes, session.key);
+        const manifestBlobSha = await createBlob({ owner: session.owner, repo: session.repo, token: session.token, bytes: manifestEncrypted });
+        return [...blobEntries, { path: manifestPath(session), blobSha: manifestBlobSha }];
+      },
+    });
+  }
+
+  // A lone file that doesn't need chunking has nothing to batch with -
+  // one Contents-API PUT already bundles blob+tree+commit+ref into a
+  // single HTTP call, cheaper than the Git Data API's blob+ref-lookup+
+  // tree+commit+ref-update sequence commitFilesToManifest needs. So the
+  // common "pick one file" case stays on the plain putFile path; batching
+  // only pays off once there's more than one blob to land together
+  // (multiple files, or one file's worth of chunks).
+  async function uploadSingleSmallFile(file, session, statusEl) {
+    const name = file.webkitRelativePath || file.name;
+    const type = guessType(file);
+    statusEl.textContent = `Encrypting ${name}…`;
+    const fileBytes = new Uint8Array(await file.arrayBuffer());
+    const encrypted = await encryptBuffer(fileBytes, session.key);
+    const id = crypto.randomUUID();
+
+    statusEl.textContent = `Uploading ${name}…`;
+    await putFile({ owner: session.owner, repo: session.repo, token: session.token, path: blobPath(session, id), bytes: encrypted, message: "store: blob" });
+
+    const entry = { id, name, type, size: file.size, uploadedAt: new Date().toISOString() };
+    statusEl.textContent = "Updating index…";
+    const { entries: freshEntries, sha } = await loadManifest(session); // re-fetch sha to avoid a stale write
+    await saveManifest(session, [...freshEntries, entry], sha);
+    statusEl.textContent = `Done: ${name}`;
+  }
+
+  // Accepts a FileList (or array). Every file's blob(s) are created
+  // concurrently (FILE_UPLOAD_CONCURRENCY at once, no commit contention at
+  // that stage - createBlob just writes loose objects), then committed in
+  // batches of COMMIT_BATCH_SIZE files: one commit per batch instead of
+  // one per file/chunk, which is what actually bounds upload time on a
+  // big multi-file/folder upload (GitHub's Contents API can only land one
+  // commit at a time, no matter how many PUTs are in flight). A final
+  // flush after the loop commits whatever's left under a full batch.
   async function upload(files, statusEl) {
     const session = getSession();
     const fileArray = Array.from(files);
-    const newEntries = [];
-    for (let i = 0; i < fileArray.length; i += 1) {
-      const file = fileArray[i];
-      const name = file.webkitRelativePath || file.name;
-      statusEl.textContent = fileArray.length > 1
-        ? `Uploading ${i + 1}/${fileArray.length}: ${name}…`
-        : `Uploading ${name}…`;
-      newEntries.push(await uploadOne(file, session));
+
+    if (fileArray.length === 1 && fileArray[0].size <= CHUNK_SIZE) {
+      await uploadSingleSmallFile(fileArray[0], session, statusEl);
+      await refresh();
+      return;
     }
 
-    statusEl.textContent = "Updating index…";
-    const { entries: freshEntries, sha } = await loadManifest(session); // re-fetch sha to avoid a stale write
-    const nextEntries = [...freshEntries, ...newEntries];
-    await saveManifest(session, nextEntries, sha);
-    entries = nextEntries;
-    manifestSha = null; // stale after the write above; refresh() re-fetches it if needed
+    let pending = [];
+    let commitQueue = Promise.resolve();
+    let committedCount = 0;
+    function flush() {
+      if (pending.length === 0) return commitQueue;
+      const batch = pending;
+      pending = [];
+      commitQueue = commitQueue.then(async () => {
+        await commitFilesToManifest(
+          session,
+          batch.flatMap((b) => b.blobEntries),
+          batch.map((b) => b.manifestEntry),
+          `store: ${batch.length} file(s)`
+        );
+        committedCount += batch.length;
+        statusEl.textContent = `Committed ${committedCount}/${fileArray.length} file(s)…`;
+      });
+      return commitQueue;
+    }
+
+    await runWithConcurrency(fileArray, FILE_UPLOAD_CONCURRENCY, async (file) => {
+      const result = await createBlobsForFile(file, session, (msg) => { statusEl.textContent = msg; });
+      pending.push(result);
+      if (pending.length >= COMMIT_BATCH_SIZE) await flush();
+    });
+    await flush();
 
     statusEl.textContent = fileArray.length > 1 ? `Done: ${fileArray.length} files.` : `Done: ${fileArray[0].name}`;
-    render();
+    await refresh(); // manifest was rewritten server-side by commitFilesToManifest - re-fetch rather than trying to merge local state
   }
 
   async function removeEntry(id) {
