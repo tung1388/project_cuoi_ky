@@ -443,18 +443,26 @@ function createGallery({ listEl, getSession, canManage }) {
   }
 
   // Batches many already-created blobs into ONE commit that ALSO updates
-  // the manifest, via the Git Data API (see commitBatch in github.js). The
-  // manifest is re-read fresh inside buildEntries - called again on every
-  // retry - so a concurrent external write to it (another tab, the CLI)
-  // doesn't get silently clobbered even under a genuine conflict.
-  async function commitFilesToManifest(session, blobEntries, newManifestEntries, message) {
+  // the manifest, via the Git Data API (see commitBatch in github.js).
+  //
+  // `baseEntries`, if given, is used as the starting point on the FIRST
+  // attempt instead of re-reading the manifest - GitHub's Contents API GET
+  // can return stale content for a path immediately after writing it (see
+  // the read-path note atop github.js), which would otherwise silently
+  // drop entries an earlier batch in this same upload just committed. A
+  // retry (only reached after a genuine 409/422 conflict from commitBatch)
+  // DOES re-read fresh, since at that point something really did change
+  // underneath us and a stale local baseline would be actively wrong.
+  async function commitFilesToManifest(session, blobEntries, newManifestEntries, message, baseEntries) {
+    let attempt = 0;
     return commitBatch({
       owner: session.owner,
       repo: session.repo,
       token: session.token,
       message,
       buildEntries: async () => {
-        const { entries: existing } = await loadManifest(session);
+        const existing = attempt === 0 && baseEntries ? baseEntries : (await loadManifest(session)).entries;
+        attempt += 1;
         const merged = [...existing, ...newManifestEntries];
         const manifestBytes = new TextEncoder().encode(JSON.stringify(merged));
         const manifestEncrypted = await encryptBuffer(manifestBytes, session.key);
@@ -487,6 +495,7 @@ function createGallery({ listEl, getSession, canManage }) {
     const { entries: freshEntries, sha } = await loadManifest(session); // re-fetch sha to avoid a stale write
     await saveManifest(session, [...freshEntries, entry], sha);
     statusEl.textContent = `Done: ${name}`;
+    return entry;
   }
 
   // Accepts a FileList (or array). Every file's blob(s) are created
@@ -502,26 +511,38 @@ function createGallery({ listEl, getSession, canManage }) {
     const fileArray = Array.from(files);
 
     if (fileArray.length === 1 && fileArray[0].size <= CHUNK_SIZE) {
-      await uploadSingleSmallFile(fileArray[0], session, statusEl);
-      await refresh();
+      const entry = await uploadSingleSmallFile(fileArray[0], session, statusEl);
+      // Update local state directly rather than re-fetching the manifest we
+      // just wrote - GitHub's Contents API GET can return stale content for
+      // a path immediately after writing it (see the read-path caching note
+      // atop github.js), which would silently show the old (pre-upload)
+      // list even though the commit genuinely landed.
+      entries = [...entries, entry];
+      render();
       return;
     }
 
     let pending = [];
     let commitQueue = Promise.resolve();
     let committedCount = 0;
+    const committedEntries = [];
+    let baseEntries = entries; // grows after each batch so a later batch's commit doesn't need to re-read (and risk a stale read of) what an earlier batch in this same upload just wrote
     function flush() {
       if (pending.length === 0) return commitQueue;
       const batch = pending;
       pending = [];
       commitQueue = commitQueue.then(async () => {
+        const batchManifestEntries = batch.map((b) => b.manifestEntry);
         await commitFilesToManifest(
           session,
           batch.flatMap((b) => b.blobEntries),
-          batch.map((b) => b.manifestEntry),
-          `store: ${batch.length} file(s)`
+          batchManifestEntries,
+          `store: ${batch.length} file(s)`,
+          baseEntries
         );
+        baseEntries = [...baseEntries, ...batchManifestEntries];
         committedCount += batch.length;
+        committedEntries.push(...batchManifestEntries);
         statusEl.textContent = `Committed ${committedCount}/${fileArray.length} file(s)…`;
       });
       return commitQueue;
@@ -534,8 +555,13 @@ function createGallery({ listEl, getSession, canManage }) {
     });
     await flush();
 
+    // Update local state directly rather than re-fetching the manifest we
+    // just wrote - see the comment on the single-file fast path above for
+    // why: an immediate re-read can come back stale even after a genuinely
+    // landed commit.
+    entries = [...entries, ...committedEntries];
+    render();
     statusEl.textContent = fileArray.length > 1 ? `Done: ${fileArray.length} files.` : `Done: ${fileArray[0].name}`;
-    await refresh(); // manifest was rewritten server-side by commitFilesToManifest - re-fetch rather than trying to merge local state
   }
 
   async function removeEntry(id) {
