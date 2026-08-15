@@ -181,13 +181,23 @@ function guessType(file) {
 // entry (see createBlobsForFile) fetches+decrypts every chunk in parallel
 // and reassembles them in order; name/type/size all live on the manifest
 // entry itself, so there's no per-blob envelope to unpack.
-async function fetchEntryBytes(session, entry) {
+//
+// `onProgress(completed, total)`, if given, fires after each chunk
+// finishes decrypting - for a large (100MB+) chunked file, the network
+// requests themselves finish in a second or two, but base64-decoding +
+// decrypting many multi-megabyte chunks is CPU-bound and can block the
+// tab for a long stretch with zero visible feedback otherwise, which
+// reads as "hung" or "broken" rather than "still working."
+async function fetchEntryBytes(session, entry, onProgress) {
   if (entry.chunked) {
+    let completed = 0;
     const chunks = await Promise.all(
       Array.from({ length: entry.chunkCount }, async (_, index) => {
         const stored = await fetchFile(session, chunkPath(session, entry.id, index));
         if (!stored) throw new Error(`${entry.name} is missing chunk ${index} (was it deleted outside this app?).`);
-        return decryptBuffer(stored.bytes, session.key);
+        const bytes = await decryptBuffer(stored.bytes, session.key);
+        onProgress?.(++completed, entry.chunkCount);
+        return bytes;
       })
     );
     const total = chunks.reduce((sum, c) => sum + c.length, 0);
@@ -254,9 +264,30 @@ async function previewEntry(session, entry, onEdited) {
 
   let fileBytes;
   try {
-    fileBytes = await fetchEntryBytes(session, entry);
+    fileBytes = await fetchEntryBytes(session, entry, entry.chunked
+      ? (completed, total) => { els.previewBody.innerHTML = `<p class="hint">Decrypting… (${completed}/${total} chunks)</p>`; }
+      : undefined);
   } catch (err) {
     els.previewBody.innerHTML = `<p class="error">${err.message}</p>`;
+    return;
+  }
+
+  // A big PDF/text file rendered inline means the browser's own PDF/text
+  // viewer then has to parse and lay out the whole thing inside an
+  // iframe - on top of the decrypt work above, that's enough to freeze
+  // the tab for tens of seconds on a large (100MB+, many-hundred-page)
+  // document, with nothing on screen suggesting it's still working
+  // (confirmed live: the tab became unresponsive to screenshots for
+  // 20-30s on a 200MB+ PDF before it finally rendered). Chunked implies
+  // over CHUNK_SIZE (18MB) already, so gate just that case rather than
+  // guessing at a separate size threshold.
+  const kindForGate = entry.type.split("/")[0];
+  if (entry.chunked && (entry.type === "application/pdf" || kindForGate === "text")) {
+    els.previewBody.innerHTML = "";
+    const notice = document.createElement("p");
+    notice.className = "hint";
+    notice.textContent = `${formatBytes(entry.size)} is too large to preview inline without risking the tab freezing - use Download instead.`;
+    els.previewBody.appendChild(notice);
     return;
   }
 
