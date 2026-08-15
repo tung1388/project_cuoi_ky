@@ -176,51 +176,68 @@ function guessType(file) {
   return "application/octet-stream";
 }
 
-// Fetch + decrypt an uploaded entry - shared by download and preview,
-// which only differ in what they do with the resulting bytes. A chunked
-// entry (see createBlobsForFile) fetches+decrypts every chunk in parallel
-// and reassembles them in order; name/type/size all live on the manifest
-// entry itself, so there's no per-blob envelope to unpack.
+// entry.id -> decrypted Uint8Array. Thumbnail loading, preview, and
+// download can all independently ask for the same entry's bytes (e.g.
+// opening a preview right after its thumbnail already decrypted it, or
+// downloading a file you just previewed) - without this, each of those
+// would re-fetch and re-decrypt every chunk from scratch. Keyed by the
+// entry's own id (a random UUID, globally unique across folders), so
+// there's no collision risk between galleries sharing this cache.
+const decryptedCache = new Map();
+
+// Fetch + decrypt an uploaded entry - shared by thumbnail loading,
+// download, and preview, which only differ in what they do with the
+// resulting bytes. A chunked entry (see createBlobsForFile) fetches+
+// decrypts every chunk in parallel and reassembles them in order; name/
+// type/size all live on the manifest entry itself, so there's no
+// per-blob envelope to unpack.
 //
 // `onProgress(completed, total)`, if given, fires after each chunk
-// finishes decrypting - for a large (100MB+) chunked file, the network
-// requests themselves finish in a second or two, but base64-decoding +
-// decrypting many multi-megabyte chunks is CPU-bound and can block the
-// tab for a long stretch with zero visible feedback otherwise, which
-// reads as "hung" or "broken" rather than "still working."
+// finishes decrypting (skipped entirely on a cache hit) - for a large
+// (100MB+) chunked file, the network requests themselves finish in a
+// second or two, but base64-decoding + decrypting many multi-megabyte
+// chunks is CPU-bound and can block the tab for a long stretch with zero
+// visible feedback otherwise, which reads as "hung" or "broken" rather
+// than "still working."
 async function fetchEntryBytes(session, entry, onProgress) {
+  const cached = decryptedCache.get(entry.id);
+  if (cached) return cached;
+
+  let bytes;
   if (entry.chunked) {
     let completed = 0;
     const chunks = await Promise.all(
       Array.from({ length: entry.chunkCount }, async (_, index) => {
         const stored = await fetchFile(session, chunkPath(session, entry.id, index));
         if (!stored) throw new Error(`${entry.name} is missing chunk ${index} (was it deleted outside this app?).`);
-        const bytes = await decryptBuffer(stored.bytes, session.key);
+        const chunkBytes = await decryptBuffer(stored.bytes, session.key);
         onProgress?.(++completed, entry.chunkCount);
-        return bytes;
+        return chunkBytes;
       })
     );
     const total = chunks.reduce((sum, c) => sum + c.length, 0);
-    const out = new Uint8Array(total);
+    bytes = new Uint8Array(total);
     let offset = 0;
     for (const chunk of chunks) {
-      out.set(chunk, offset);
+      bytes.set(chunk, offset);
       offset += chunk.length;
     }
-    return out;
+  } else {
+    const stored = await fetchFile(session, blobPath(session, entry.id));
+    if (!stored) {
+      throw new Error(`${entry.name} is missing from the repo (was it deleted outside this app?).`);
+    }
+    bytes = await decryptBuffer(stored.bytes, session.key);
   }
 
-  const stored = await fetchFile(session, blobPath(session, entry.id));
-  if (!stored) {
-    throw new Error(`${entry.name} is missing from the repo (was it deleted outside this app?).`);
-  }
-  return decryptBuffer(stored.bytes, session.key);
+  decryptedCache.set(entry.id, bytes);
+  return bytes;
 }
 
-async function downloadEntry(session, entry) {
+async function downloadEntry(session, entry, onProgress) {
   let fileBytes;
   try {
-    fileBytes = await fetchEntryBytes(session, entry);
+    fileBytes = await fetchEntryBytes(session, entry, onProgress);
   } catch (err) {
     alert(err.message);
     return;
@@ -311,6 +328,7 @@ async function previewEntry(session, entry, onEdited) {
             const idx = freshEntries.findIndex((e) => e.id === entry.id);
             if (idx !== -1) freshEntries[idx] = { ...freshEntries[idx], size: newDbBytes.length, uploadedAt: new Date().toISOString() };
             await saveManifest(session, freshEntries, manifestSha);
+            decryptedCache.set(entry.id, newDbBytes); // the cached bytes are now stale ciphertext-wise; we already have the new plaintext in hand
             onEdited?.();
           }
         : undefined,
@@ -411,7 +429,13 @@ function createGallery({ listEl, getSession, canManage }) {
       const downloadBtn = document.createElement("button");
       downloadBtn.textContent = "⭳";
       downloadBtn.title = "Download";
-      downloadBtn.onclick = (e) => { e.stopPropagation(); downloadEntry(getSession(), entry); };
+      downloadBtn.onclick = (e) => {
+        e.stopPropagation();
+        const onProgress = entry.chunked
+          ? (completed, total) => { downloadBtn.textContent = `${completed}/${total}`; }
+          : undefined;
+        downloadEntry(getSession(), entry, onProgress).finally(() => { downloadBtn.textContent = "⭳"; });
+      };
       actions.append(downloadBtn);
       if (canManage()) {
         const deleteBtn = document.createElement("button");
@@ -579,8 +603,15 @@ function createGallery({ listEl, getSession, canManage }) {
       return commitQueue;
     }
 
+    // Files upload FILE_UPLOAD_CONCURRENCY at a time, so createBlobsForFile's
+    // own per-file/per-chunk status messages (below) interleave unpredictably
+    // - preparedCount gives a steady, monotonic "N/Total" on top of that
+    // instead of only ever moving at commit checkpoints.
+    let preparedCount = 0;
     await runWithConcurrency(fileArray, FILE_UPLOAD_CONCURRENCY, async (file) => {
       const result = await createBlobsForFile(file, session, (msg) => { statusEl.textContent = msg; });
+      preparedCount += 1;
+      statusEl.textContent = `Prepared ${preparedCount}/${fileArray.length} file(s)…`;
       pending.push(result);
       if (pending.length >= COMMIT_BATCH_SIZE) await flush();
     });
@@ -605,6 +636,7 @@ function createGallery({ listEl, getSession, canManage }) {
     const { sha } = await loadManifest(session); // re-fetch sha to avoid a stale write
     await saveManifest(session, nextEntries, sha);
     entries = nextEntries;
+    decryptedCache.delete(id); // frees the (possibly large) decrypted bytes now that nothing references this entry
     render();
   }
 
