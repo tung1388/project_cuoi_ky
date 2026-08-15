@@ -21,9 +21,37 @@
 // =====================================================================
 
 const API = "https://api.github.com";
+const REQUEST_TIMEOUT_MS = 60_000; // generous enough for an 18MB chunk's base64-inflated body over a slow connection
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Plain fetch() never times out on its own - a stalled connection (flaky
+// wifi, a dropped packet mid-upload of an 18MB chunk, GitHub itself
+// hanging) just leaves the caller awaiting forever with nothing to catch
+// or retry (confirmed as the cause of large uploads/downloads "just
+// getting stuck" with no error). Aborting after REQUEST_TIMEOUT_MS turns
+// that into an ordinary rejected promise, so the retry loops below (and
+// the shared write queue, which would otherwise wedge for the rest of
+// the session behind a single hung write) actually get a chance to run.
+async function fetchWithTimeout(url, options) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (err) {
+    if (err.name === "AbortError") {
+      // status: 0 is the conventional "never got an HTTP response at all"
+      // marker (network failure, timeout) - lets callers retry this the
+      // same way they'd retry a 409/422, without conflating it with a
+      // real (non-retryable) 4xx from GitHub.
+      throw Object.assign(new Error(`request timed out after ${REQUEST_TIMEOUT_MS / 1000}s: ${url}`), { status: 0 });
+    }
+    throw Object.assign(err, { status: err.status ?? 0 });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function headers(token) {
@@ -47,17 +75,34 @@ function base64ToBytes(b64) {
   return bytes;
 }
 
+const BLOB_FETCH_RETRY_DELAYS_MS = [300, 1000, 3000];
+
+// Called once per chunk when reassembling a large chunked file for
+// preview/download (see fetchEntryBytes in app.js) - same exposure as
+// createBlob's per-chunk writes, just on the read side, so it gets the
+// same small retry for a timeout/network failure (status 0). A real HTTP
+// error response still fails immediately.
 async function getBlobBytes({ owner, repo, sha, authHeaders }) {
-  const res = await fetch(`${API}/repos/${owner}/${repo}/git/blobs/${sha}`, { headers: authHeaders });
-  if (!res.ok) throw new Error(`github blob fetch failed: ${res.status} ${(await res.text()).slice(0, 300)}`);
-  const data = await res.json();
-  return base64ToBytes(data.content);
+  let lastError;
+  for (let attempt = 0; attempt <= BLOB_FETCH_RETRY_DELAYS_MS.length; attempt += 1) {
+    try {
+      const res = await fetchWithTimeout(`${API}/repos/${owner}/${repo}/git/blobs/${sha}`, { headers: authHeaders });
+      if (!res.ok) throw Object.assign(new Error(`github blob fetch failed: ${res.status} ${(await res.text()).slice(0, 300)}`), { status: res.status });
+      const data = await res.json();
+      return base64ToBytes(data.content);
+    } catch (err) {
+      lastError = err;
+      if (err.status !== 0 || attempt === BLOB_FETCH_RETRY_DELAYS_MS.length) throw lastError;
+      await sleep(BLOB_FETCH_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+  throw lastError;
 }
 
 /** Returns { bytes, sha } for an existing file, or null if the path doesn't exist. */
 export async function getFile({ owner, repo, token, path }) {
   const authHeaders = headers(token);
-  const res = await fetch(`${API}/repos/${owner}/${repo}/contents/${encodeURI(path)}`, { headers: authHeaders });
+  const res = await fetchWithTimeout(`${API}/repos/${owner}/${repo}/contents/${encodeURI(path)}`, { headers: authHeaders });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`github get failed: ${res.status} ${(await res.text()).slice(0, 300)}`);
   const meta = await res.json();
@@ -73,7 +118,7 @@ export async function getFile({ owner, repo, token, path }) {
  */
 export async function getPublicFile({ owner, repo, path }) {
   const authHeaders = { Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" };
-  const res = await fetch(`${API}/repos/${owner}/${repo}/contents/${encodeURI(path)}`, { headers: authHeaders });
+  const res = await fetchWithTimeout(`${API}/repos/${owner}/${repo}/contents/${encodeURI(path)}`, { headers: authHeaders });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`github get failed: ${res.status} ${(await res.text()).slice(0, 300)}`);
   const meta = await res.json();
@@ -118,18 +163,28 @@ async function putFileNow({ owner, repo, token, path, bytes, message, sha }) {
 
   let lastError;
   for (let attempt = 0; attempt <= COMMIT_CONFLICT_RETRY_DELAYS_MS.length; attempt += 1) {
-    const res = await fetch(`${API}/repos/${owner}/${repo}/contents/${encodeURI(path)}`, {
-      method: "PUT",
-      headers: { ...headers(token), "Content-Type": "application/json" },
-      body,
-    });
-    if (res.ok) {
-      const data = await res.json();
-      return { sha: data.content.sha, commit_sha: data.commit.sha };
+    let status;
+    try {
+      const res = await fetchWithTimeout(`${API}/repos/${owner}/${repo}/contents/${encodeURI(path)}`, {
+        method: "PUT",
+        headers: { ...headers(token), "Content-Type": "application/json" },
+        body,
+      });
+      if (res.ok) {
+        const data = await res.json();
+        return { sha: data.content.sha, commit_sha: data.commit.sha };
+      }
+      status = res.status;
+      lastError = new Error(`github put failed: ${res.status} ${(await res.text()).slice(0, 300)}`);
+    } catch (err) {
+      // A timeout/network failure (status 0, from fetchWithTimeout) never
+      // got a response at all - retry it the same as a 409, since a fetch
+      // that stalled on a slow connection is exactly the kind of thing a
+      // retry (or just trying again a moment later) can recover from.
+      status = err.status ?? 0;
+      lastError = err;
     }
-    const text = await res.text();
-    lastError = new Error(`github put failed: ${res.status} ${text.slice(0, 300)}`);
-    if (res.status !== 409 || attempt === COMMIT_CONFLICT_RETRY_DELAYS_MS.length) throw lastError;
+    if ((status !== 409 && status !== 0) || attempt === COMMIT_CONFLICT_RETRY_DELAYS_MS.length) throw lastError;
     await sleep(COMMIT_CONFLICT_RETRY_DELAYS_MS[attempt]);
   }
   throw lastError;
@@ -145,23 +200,45 @@ async function putFileNow({ owner, repo, token, path, bytes, message, sha }) {
 // upload land as one commit instead of one per file.
 // ---------------------------------------------------------------------
 
-/** Creates a git blob (raw content, not yet reachable from any commit) - no ref/commit involved, so many can run concurrently with zero contention. */
+const BLOB_CREATE_RETRY_DELAYS_MS = [300, 1000, 3000];
+
+/**
+ * Creates a git blob (raw content, not yet reachable from any commit) -
+ * no ref/commit involved, so many can run concurrently with zero
+ * contention. Called once per chunk on a large upload (see
+ * createBlobsForFile in app.js), so it's the single most-repeated network
+ * call during a big upload and the one most exposed to a single stalled
+ * connection - retries a timeout/network failure (status 0) a few times
+ * before giving up; a real HTTP error response (bad token, payload too
+ * large, etc.) still fails immediately since retrying that wouldn't help.
+ */
 export async function createBlob({ owner, repo, token, bytes }) {
-  const res = await fetch(`${API}/repos/${owner}/${repo}/git/blobs`, {
-    method: "POST",
-    headers: { ...headers(token), "Content-Type": "application/json" },
-    body: JSON.stringify({ content: bytesToBase64(bytes), encoding: "base64" }),
-  });
-  if (!res.ok) throw new Error(`github blob create failed: ${res.status} ${(await res.text()).slice(0, 300)}`);
-  const data = await res.json();
-  return data.sha;
+  const body = JSON.stringify({ content: bytesToBase64(bytes), encoding: "base64" });
+  let lastError;
+  for (let attempt = 0; attempt <= BLOB_CREATE_RETRY_DELAYS_MS.length; attempt += 1) {
+    try {
+      const res = await fetchWithTimeout(`${API}/repos/${owner}/${repo}/git/blobs`, {
+        method: "POST",
+        headers: { ...headers(token), "Content-Type": "application/json" },
+        body,
+      });
+      if (!res.ok) throw Object.assign(new Error(`github blob create failed: ${res.status} ${(await res.text()).slice(0, 300)}`), { status: res.status });
+      const data = await res.json();
+      return data.sha;
+    } catch (err) {
+      lastError = err;
+      if (err.status !== 0 || attempt === BLOB_CREATE_RETRY_DELAYS_MS.length) throw lastError;
+      await sleep(BLOB_CREATE_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+  throw lastError;
 }
 
 const branchCache = new Map(); // "owner/repo" -> default_branch, doesn't change mid-session
 async function getDefaultBranch({ owner, repo, token }) {
   const key = `${owner}/${repo}`;
   if (branchCache.has(key)) return branchCache.get(key);
-  const res = await fetch(`${API}/repos/${owner}/${repo}`, { headers: headers(token) });
+  const res = await fetchWithTimeout(`${API}/repos/${owner}/${repo}`, { headers: headers(token) });
   if (!res.ok) throw new Error(`github repo lookup failed: ${res.status}`);
   const { default_branch } = await res.json();
   branchCache.set(key, default_branch);
@@ -192,21 +269,21 @@ export async function commitBatch({ owner, repo, token, buildEntries, message })
 }
 
 async function commitBatchNow({ owner, repo, token, buildEntries, message }) {
-  const branch = await getDefaultBranch({ owner, repo, token });
   let lastError;
   for (let attempt = 0; attempt <= BATCH_COMMIT_RETRY_DELAYS_MS.length; attempt += 1) {
     try {
-      const refRes = await fetch(`${API}/repos/${owner}/${repo}/git/ref/heads/${branch}`, { headers: headers(token) });
+      const branch = await getDefaultBranch({ owner, repo, token }); // memoized on success, so retrying this is cheap
+      const refRes = await fetchWithTimeout(`${API}/repos/${owner}/${repo}/git/ref/heads/${branch}`, { headers: headers(token) });
       if (!refRes.ok) throw Object.assign(new Error(`github ref lookup failed: ${refRes.status}`), { status: refRes.status });
       const { object: { sha: parentSha } } = await refRes.json();
 
-      const parentCommitRes = await fetch(`${API}/repos/${owner}/${repo}/git/commits/${parentSha}`, { headers: headers(token) });
+      const parentCommitRes = await fetchWithTimeout(`${API}/repos/${owner}/${repo}/git/commits/${parentSha}`, { headers: headers(token) });
       if (!parentCommitRes.ok) throw Object.assign(new Error(`github commit lookup failed: ${parentCommitRes.status}`), { status: parentCommitRes.status });
       const { tree: { sha: baseTreeSha } } = await parentCommitRes.json();
 
       const entries = await buildEntries();
 
-      const treeRes = await fetch(`${API}/repos/${owner}/${repo}/git/trees`, {
+      const treeRes = await fetchWithTimeout(`${API}/repos/${owner}/${repo}/git/trees`, {
         method: "POST",
         headers: { ...headers(token), "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -220,7 +297,7 @@ async function commitBatchNow({ owner, repo, token, buildEntries, message }) {
       }
       const { sha: newTreeSha } = await treeRes.json();
 
-      const commitRes = await fetch(`${API}/repos/${owner}/${repo}/git/commits`, {
+      const commitRes = await fetchWithTimeout(`${API}/repos/${owner}/${repo}/git/commits`, {
         method: "POST",
         headers: { ...headers(token), "Content-Type": "application/json" },
         body: JSON.stringify({ message, tree: newTreeSha, parents: [parentSha] }),
@@ -231,7 +308,7 @@ async function commitBatchNow({ owner, repo, token, buildEntries, message }) {
       }
       const { sha: newCommitSha } = await commitRes.json();
 
-      const updateRefRes = await fetch(`${API}/repos/${owner}/${repo}/git/refs/heads/${branch}`, {
+      const updateRefRes = await fetchWithTimeout(`${API}/repos/${owner}/${repo}/git/refs/heads/${branch}`, {
         method: "PATCH",
         headers: { ...headers(token), "Content-Type": "application/json" },
         body: JSON.stringify({ sha: newCommitSha }),
@@ -246,8 +323,11 @@ async function commitBatchNow({ owner, repo, token, buildEntries, message }) {
       return { commit_sha: newCommitSha };
     } catch (err) {
       lastError = err;
-      const isConflict = err.status === 409 || err.status === 422;
-      if (!isConflict || attempt === BATCH_COMMIT_RETRY_DELAYS_MS.length) throw lastError;
+      // status 0 is a timeout/network failure (see fetchWithTimeout) - retry
+      // it the same as a genuine 409/422 conflict, since a stalled request
+      // is exactly the kind of thing trying again a moment later recovers.
+      const isRetryable = err.status === 409 || err.status === 422 || err.status === 0;
+      if (!isRetryable || attempt === BATCH_COMMIT_RETRY_DELAYS_MS.length) throw lastError;
       await sleep(withJitter(BATCH_COMMIT_RETRY_DELAYS_MS[attempt]));
     }
   }
