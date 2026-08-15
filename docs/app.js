@@ -46,7 +46,7 @@ const PUBLIC_FOLDER = "public";
 // folders' equivalent, gated behind a password instead).
 const PUBLIC_KEY = "githost-public-folder-shared-key-v1";
 
-const CHUNK_UPLOAD_CONCURRENCY = 4; // chunks within one big file
+const CHUNK_UPLOAD_CONCURRENCY = 8; // chunks within one big file - createBlob has zero commit contention (see github.js), so this is purely a GitHub-secondary-rate-limit tradeoff; the reference project found ~12 safe for whole-file concurrency, this is comfortably under that
 const FILE_UPLOAD_CONCURRENCY = 8; // whole files within one batch upload - blob creation only, no commit contention
 const COMMIT_BATCH_SIZE = 50; // files per commit - keeps each commit's tree small and bounds how much uncommitted work a crash mid-batch loses
 
