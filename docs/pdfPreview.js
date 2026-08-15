@@ -8,21 +8,22 @@
 // manual <script>-injection (that trick exists there only because sql.js
 // is a classic global script, not a module).
 //
-// Renders a WINDOW of WINDOW_SIZE pages at a time onto stacked <canvas>
-// elements, scrollable within that window - not the whole document at
-// once (handing everything to the browser's native <iframe> PDF viewer
-// meant it had to lay out every page up front, which was the actual
-// cause of the tab freezing on large PDFs, not network/decrypt speed),
-// and not strictly one page at a time either (loses the "scroll through
-// a few pages" feel of a normal viewer). Prev/Next page through windows
-// of pages; a page-number field and a table-of-contents panel (from the
-// PDF's own outline, when it has one) both jump straight to a page,
-// which re-centers the window there.
+// Feels like the browser's native PDF viewer - one continuous scroll
+// through the whole document - but doesn't render everything up front:
+// every page gets an empty placeholder (sized from page 1's dimensions,
+// so the scrollbar reflects the true document length immediately), and
+// an IntersectionObserver renders a page's actual canvas only once it's
+// within PRELOAD_MARGIN_PX of the viewport, evicting it back to a
+// placeholder once it scrolls back out - bounded memory regardless of
+// document length. Handing the whole decrypted PDF to a native <iframe>
+// viewer instead (the previous approach) meant the browser had to lay
+// out every page up front, which was the actual cause of the tab
+// freezing on large PDFs, not network/decrypt speed.
 // =====================================================================
 
 const PDF_JS_VERSION = "6.2.108";
 const PDF_JS_BASE = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDF_JS_VERSION}/build/`;
-const WINDOW_SIZE = 10;
+const PRELOAD_MARGIN_PX = 1200; // how far outside the viewport to render/evict pages - big enough that fast scrolling rarely outruns it
 
 let pdfjsPromise = null;
 function loadPdfJs() {
@@ -72,11 +73,11 @@ async function resolveDestPage(doc, dest) {
 }
 
 /**
- * Renders a windowed, scrollable PDF viewer for `bytes` (raw decrypted
- * PDF) into `container`. Returns the opened pdf.js document so the
- * caller can clean it up (`doc.destroy()`) once the preview is dismissed
- * - same idea as sqlitePreview's returned Database, just for pdf.js's
- * parsed state.
+ * Renders a continuous-scroll PDF viewer for `bytes` (raw decrypted PDF)
+ * into `container`. Returns the opened pdf.js document so the caller can
+ * clean it up (`doc.destroy()`) once the preview is dismissed - same
+ * idea as sqlitePreview's returned Database, just for pdf.js's parsed
+ * state.
  */
 export async function renderPdfPreview(bytes, container) {
   container.innerHTML = '<p class="hint">Loading PDF engine…</p>';
@@ -107,20 +108,21 @@ export async function renderPdfPreview(bytes, container) {
   tocToggleBtn.textContent = "Contents";
   const prevBtn = document.createElement("button");
   prevBtn.className = "secondary";
-  prevBtn.textContent = `◀ ${WINDOW_SIZE}`;
+  prevBtn.textContent = "◀";
+  prevBtn.title = "Previous page";
   const pageInput = document.createElement("input");
   pageInput.type = "number";
   pageInput.min = "1";
+  pageInput.max = String(doc.numPages);
   pageInput.className = "pdf-page-input";
   const totalLabel = document.createElement("span");
   totalLabel.className = "hint";
   totalLabel.textContent = `/ ${doc.numPages}`;
   const nextBtn = document.createElement("button");
   nextBtn.className = "secondary";
-  nextBtn.textContent = `${WINDOW_SIZE} ▶`;
-  const rangeLabel = document.createElement("span");
-  rangeLabel.className = "hint";
-  toolbar.append(tocToggleBtn, prevBtn, pageInput, totalLabel, nextBtn, rangeLabel);
+  nextBtn.textContent = "▶";
+  nextBtn.title = "Next page";
+  toolbar.append(tocToggleBtn, prevBtn, pageInput, totalLabel, nextBtn);
 
   const body = document.createElement("div");
   body.className = "pdf-body";
@@ -133,85 +135,106 @@ export async function renderPdfPreview(bytes, container) {
   wrap.append(toolbar, body);
   container.appendChild(wrap);
 
-  let windowStart = 1;
-  let renderGeneration = 0; // bumped on every window change - lets an in-flight render notice it's stale and stop early
-  let currentPageObserver = null;
+  // Most documents use one page size throughout - page 1's dimensions
+  // become every placeholder's reserved aspect ratio, so the scrollbar
+  // already reflects the true document length before anything else
+  // renders. A page that turns out a different size just corrects its
+  // own placeholder once it actually renders (see ensureRendered).
+  const firstPage = await doc.getPage(1);
+  const firstViewport = firstPage.getViewport({ scale: 1 });
+  const placeholderRatio = `${firstViewport.width} / ${firstViewport.height}`;
 
-  async function renderWindow(requestedStart) {
-    const gen = ++renderGeneration;
-    const maxStart = Math.max(1, doc.numPages - WINDOW_SIZE + 1);
-    windowStart = Math.max(1, Math.min(requestedStart, maxStart));
-    const endPage = Math.min(doc.numPages, windowStart + WINDOW_SIZE - 1);
+  const pageStates = []; // { p, pageWrap, rendered, renderPromise }
+  const frag = document.createDocumentFragment();
+  for (let p = 1; p <= doc.numPages; p += 1) {
+    const pageWrap = document.createElement("div");
+    pageWrap.className = "pdf-page";
+    pageWrap.dataset.page = String(p);
+    pageWrap.style.aspectRatio = placeholderRatio;
+    frag.appendChild(pageWrap);
+    pageStates.push({ p, pageWrap, rendered: false, renderPromise: null });
+  }
+  pagesContainer.appendChild(frag);
 
-    pageInput.value = windowStart;
-    prevBtn.disabled = windowStart <= 1;
-    nextBtn.disabled = endPage >= doc.numPages;
-    rangeLabel.textContent = `(pages ${windowStart}–${endPage})`;
-
-    currentPageObserver?.disconnect();
-    pagesContainer.innerHTML = '<p class="hint">Loading pages…</p>';
-    const frag = document.createDocumentFragment();
-    const pageEls = [];
-    for (let p = windowStart; p <= endPage; p += 1) {
-      const pageWrap = document.createElement("div");
-      pageWrap.className = "pdf-page";
-      pageWrap.dataset.page = String(p);
-      const canvas = document.createElement("canvas");
-      canvas.className = "pdf-canvas";
-      pageWrap.appendChild(canvas);
-      frag.appendChild(pageWrap);
-      pageEls.push({ p, canvas, pageWrap });
-    }
-    pagesContainer.innerHTML = "";
-    pagesContainer.appendChild(frag);
-    pagesContainer.scrollTop = 0;
-
-    // Tracks whichever page is most visible while scrolling within the
-    // window and reflects it in the page field - the closest thing to
-    // "the page number" a windowed (not fully virtualized) view can give
-    // without re-fetching on every scroll tick. A single threshold like
-    // 0.5 only fires once a page crosses 50% visible - for a page taller
-    // than the scroll container (common: pages render at fit-*width*,
-    // not fit-height), that 50% mark may never be reachable at all, so
-    // the callback silently never fires. Many small thresholds instead
-    // fire on every ~5% change in visible ratio regardless of how tall
-    // the page is relative to the viewport.
-    const FINE_THRESHOLDS = Array.from({ length: 21 }, (_, i) => i / 20);
-    currentPageObserver = new IntersectionObserver(
-      (observerEntries) => {
-        let best = null;
-        for (const e of observerEntries) {
-          if (e.isIntersecting && (!best || e.intersectionRatio > best.intersectionRatio)) best = e;
-        }
-        if (best && document.activeElement !== pageInput) {
-          pageInput.value = best.target.dataset.page;
-        }
-      },
-      { root: pagesContainer, threshold: FINE_THRESHOLDS }
-    );
-
-    for (const { p, canvas, pageWrap } of pageEls) {
-      if (gen !== renderGeneration) return; // a newer window request superseded this one
-      currentPageObserver.observe(pageWrap);
-      const page = await doc.getPage(p);
+  async function ensureRendered(state) {
+    if (state.rendered || state.renderPromise) return state.renderPromise;
+    state.renderPromise = (async () => {
+      const page = await doc.getPage(state.p);
       const unscaledWidth = page.getViewport({ scale: 1 }).width;
       const fitWidth = pagesContainer.clientWidth || 640;
       const viewport = page.getViewport({ scale: Math.min(2, fitWidth / unscaledWidth) });
+      const canvas = document.createElement("canvas");
+      canvas.className = "pdf-canvas";
       canvas.width = viewport.width;
       canvas.height = viewport.height;
       try {
         await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
       } catch (err) {
         if (err?.name !== "RenderingCancelledException") throw err;
+        return; // cancelled by an evict() that raced this render - leave the placeholder as-is
       }
-    }
+      state.pageWrap.style.aspectRatio = ""; // now sized by the real canvas, not the page-1 estimate
+      state.pageWrap.innerHTML = "";
+      state.pageWrap.appendChild(canvas);
+      state.rendered = true;
+    })().finally(() => {
+      state.renderPromise = null;
+    });
+    return state.renderPromise;
   }
 
-  prevBtn.onclick = () => renderWindow(windowStart - WINDOW_SIZE);
-  nextBtn.onclick = () => renderWindow(windowStart + WINDOW_SIZE);
+  function evict(state) {
+    if (!state.rendered) return;
+    state.rendered = false;
+    state.pageWrap.innerHTML = "";
+    state.pageWrap.style.aspectRatio = placeholderRatio;
+  }
+
+  const preloadObserver = new IntersectionObserver(
+    (entries) => {
+      for (const entry of entries) {
+        const state = pageStates[Number(entry.target.dataset.page) - 1];
+        if (entry.isIntersecting) ensureRendered(state).catch(() => {}); // a single failed page shouldn't break the whole scroller
+        else evict(state);
+      }
+    },
+    { root: pagesContainer, rootMargin: `${PRELOAD_MARGIN_PX}px 0px` }
+  );
+  for (const state of pageStates) preloadObserver.observe(state.pageWrap);
+
+  // Separate, finer-grained observer just for "what page is the user
+  // looking at" (the page-number field) - the preload observer's wide
+  // rootMargin makes it unsuitable for that (it'd report a page as
+  // "current" over a thousand pixels before it's actually on screen). 21
+  // evenly-spaced thresholds fire on every ~5% visibility change; a
+  // single higher threshold (e.g. 0.5) can fail to ever fire at all for
+  // a page taller than the scroll container, since it may never reach
+  // that ratio no matter how it's scrolled.
+  const FINE_THRESHOLDS = Array.from({ length: 21 }, (_, i) => i / 20);
+  const currentPageObserver = new IntersectionObserver(
+    (entries) => {
+      let best = null;
+      for (const e of entries) {
+        if (e.isIntersecting && (!best || e.intersectionRatio > best.intersectionRatio)) best = e;
+      }
+      if (best && document.activeElement !== pageInput) {
+        pageInput.value = best.target.dataset.page;
+      }
+    },
+    { root: pagesContainer, threshold: FINE_THRESHOLDS }
+  );
+  for (const state of pageStates) currentPageObserver.observe(state.pageWrap);
+
+  function scrollToPage(p) {
+    const clamped = Math.max(1, Math.min(p, doc.numPages));
+    pageStates[clamped - 1]?.pageWrap.scrollIntoView({ block: "start" });
+  }
+
+  prevBtn.onclick = () => scrollToPage(Number(pageInput.value || 1) - 1);
+  nextBtn.onclick = () => scrollToPage(Number(pageInput.value || 1) + 1);
   pageInput.addEventListener("change", () => {
     const n = parseInt(pageInput.value, 10);
-    if (Number.isFinite(n)) renderWindow(n);
+    if (Number.isFinite(n)) scrollToPage(n);
   });
 
   let outline = null;
@@ -223,12 +246,12 @@ export async function renderPdfPreview(bytes, container) {
   if (outline && outline.length) {
     tocToggleBtn.classList.remove("hidden");
     tocPanel.appendChild(buildTocList(outline, doc, (pageNum) => {
-      renderWindow(pageNum);
+      scrollToPage(pageNum);
       tocPanel.classList.add("hidden");
     }));
     tocToggleBtn.onclick = () => tocPanel.classList.toggle("hidden");
   }
 
-  await renderWindow(1);
+  pageInput.value = 1;
   return doc;
 }
