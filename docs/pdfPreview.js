@@ -169,7 +169,14 @@ export async function renderPdfPreview(bytes, container) {
     // Tracks whichever page is most visible while scrolling within the
     // window and reflects it in the page field - the closest thing to
     // "the page number" a windowed (not fully virtualized) view can give
-    // without re-fetching on every scroll tick.
+    // without re-fetching on every scroll tick. A single threshold like
+    // 0.5 only fires once a page crosses 50% visible - for a page taller
+    // than the scroll container (common: pages render at fit-*width*,
+    // not fit-height), that 50% mark may never be reachable at all, so
+    // the callback silently never fires. Many small thresholds instead
+    // fire on every ~5% change in visible ratio regardless of how tall
+    // the page is relative to the viewport.
+    const FINE_THRESHOLDS = Array.from({ length: 21 }, (_, i) => i / 20);
     currentPageObserver = new IntersectionObserver(
       (observerEntries) => {
         let best = null;
@@ -180,7 +187,7 @@ export async function renderPdfPreview(bytes, container) {
           pageInput.value = best.target.dataset.page;
         }
       },
-      { root: pagesContainer, threshold: [0.5] }
+      { root: pagesContainer, threshold: FINE_THRESHOLDS }
     );
 
     for (const { p, canvas, pageWrap } of pageEls) {
