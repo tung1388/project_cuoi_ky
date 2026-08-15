@@ -297,13 +297,19 @@ async function previewEntry(session, entry, onEdited) {
   // (confirmed live: the tab became unresponsive to screenshots for
   // 20-30s on a 200MB+ PDF before it finally rendered). Chunked implies
   // over CHUNK_SIZE (18MB) already, so gate just that case rather than
-  // guessing at a separate size threshold.
+  // guessing at a separate size threshold. fileBytes are already decrypted
+  // and cached at this point, so choosing to risk it costs nothing extra.
   const kindForGate = entry.type.split("/")[0];
   if (entry.chunked && (entry.type === "application/pdf" || kindForGate === "text")) {
     els.previewBody.innerHTML = "";
     const notice = document.createElement("p");
     notice.className = "hint";
-    notice.textContent = `${formatBytes(entry.size)} is too large to preview inline without risking the tab freezing - use Download instead.`;
+    notice.textContent = `${formatBytes(entry.size)} is too large to preview inline without risking the tab freezing - use Download instead, or `;
+    const riskBtn = document.createElement("button");
+    riskBtn.className = "secondary";
+    riskBtn.textContent = "risk it";
+    riskBtn.onclick = () => renderMedia();
+    notice.appendChild(riskBtn);
     els.previewBody.appendChild(notice);
     return;
   }
@@ -336,34 +342,38 @@ async function previewEntry(session, entry, onEdited) {
     return;
   }
 
-  const blob = new Blob([fileBytes], { type: entry.type });
-  const url = URL.createObjectURL(blob);
-  previewObjectUrl = url;
-  els.previewBody.innerHTML = "";
+  renderMedia();
 
-  const kind = entry.type.split("/")[0];
-  let el;
-  if (kind === "image") {
-    el = document.createElement("img");
-    el.src = url;
-  } else if (kind === "video") {
-    el = document.createElement("video");
-    el.src = url;
-    el.controls = true;
-  } else if (kind === "audio") {
-    el = document.createElement("audio");
-    el.src = url;
-    el.controls = true;
-  } else if (entry.type === "application/pdf" || kind === "text") {
-    // Browsers render PDFs and plain text natively inside an <iframe>.
-    el = document.createElement("iframe");
-    el.src = url;
-  } else {
-    el = document.createElement("p");
-    el.className = "hint";
-    el.textContent = `No inline preview for ${entry.type || "this file type"} - use Download instead.`;
+  function renderMedia() {
+    const blob = new Blob([fileBytes], { type: entry.type });
+    const url = URL.createObjectURL(blob);
+    previewObjectUrl = url;
+    els.previewBody.innerHTML = "";
+
+    const kind = entry.type.split("/")[0];
+    let el;
+    if (kind === "image") {
+      el = document.createElement("img");
+      el.src = url;
+    } else if (kind === "video") {
+      el = document.createElement("video");
+      el.src = url;
+      el.controls = true;
+    } else if (kind === "audio") {
+      el = document.createElement("audio");
+      el.src = url;
+      el.controls = true;
+    } else if (entry.type === "application/pdf" || kind === "text") {
+      // Browsers render PDFs and plain text natively inside an <iframe>.
+      el = document.createElement("iframe");
+      el.src = url;
+    } else {
+      el = document.createElement("p");
+      el.className = "hint";
+      el.textContent = `No inline preview for ${entry.type || "this file type"} - use Download instead.`;
+    }
+    els.previewBody.appendChild(el);
   }
-  els.previewBody.appendChild(el);
 }
 
 // One gallery = one folder's worth of upload/list/preview/delete state.
