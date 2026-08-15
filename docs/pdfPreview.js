@@ -8,18 +8,21 @@
 // manual <script>-injection (that trick exists there only because sql.js
 // is a classic global script, not a module).
 //
-// Renders ONE page at a time onto a <canvas>, instead of handing the
-// whole decrypted PDF to the browser's native <iframe> PDF viewer: pdf.js
-// only has to parse the document's page tree and render whichever page
-// is currently visible, not lay out every page up front. That up-front
-// layout of a many-hundred-page document was the actual cause of the tab
-// freezing on large PDFs (see the chunked-PDF size gate in docs/app.js),
-// not network/decrypt speed - first-page render here is close to instant
-// even for a 1000+ page document, since pages are parsed on demand.
+// Renders a WINDOW of WINDOW_SIZE pages at a time onto stacked <canvas>
+// elements, scrollable within that window - not the whole document at
+// once (handing everything to the browser's native <iframe> PDF viewer
+// meant it had to lay out every page up front, which was the actual
+// cause of the tab freezing on large PDFs, not network/decrypt speed),
+// and not strictly one page at a time either (loses the "scroll through
+// a few pages" feel of a normal viewer). Prev/Next page through windows
+// of pages; a page-number field and a table-of-contents panel (from the
+// PDF's own outline, when it has one) both jump straight to a page,
+// which re-centers the window there.
 // =====================================================================
 
 const PDF_JS_VERSION = "6.2.108";
 const PDF_JS_BASE = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDF_JS_VERSION}/build/`;
+const WINDOW_SIZE = 10;
 
 let pdfjsPromise = null;
 function loadPdfJs() {
@@ -32,11 +35,48 @@ function loadPdfJs() {
   return pdfjsPromise;
 }
 
+// Builds a <ul> of clickable table-of-contents entries from pdf.js's
+// getOutline() result (a tree of {title, dest, items}), recursing into
+// nested sections. `dest` is either a named destination (string, needs
+// doc.getDestination() to resolve) or already an explicit destination
+// array - both end with a page *reference*, not a page number, hence
+// getPageIndex() to turn that into one.
+function buildTocList(items, doc, onJump) {
+  const ul = document.createElement("ul");
+  ul.className = "pdf-toc-list";
+  for (const item of items) {
+    const li = document.createElement("li");
+    const link = document.createElement("a");
+    link.href = "#";
+    link.textContent = item.title || "(untitled)";
+    link.onclick = async (e) => {
+      e.preventDefault();
+      const pageNum = await resolveDestPage(doc, item.dest);
+      if (pageNum) onJump(pageNum);
+    };
+    li.appendChild(link);
+    if (item.items?.length) li.appendChild(buildTocList(item.items, doc, onJump));
+    ul.appendChild(li);
+  }
+  return ul;
+}
+
+async function resolveDestPage(doc, dest) {
+  try {
+    const explicitDest = typeof dest === "string" ? await doc.getDestination(dest) : dest;
+    if (!explicitDest) return null;
+    return (await doc.getPageIndex(explicitDest[0])) + 1;
+  } catch {
+    return null; // a malformed/broken outline entry shouldn't take down the whole TOC
+  }
+}
+
 /**
- * Renders a one-page-at-a-time PDF viewer for `bytes` (raw decrypted PDF)
- * into `container`. Returns the opened pdf.js document so the caller can
- * clean it up (`doc.destroy()`) once the preview is dismissed - same idea
- * as sqlitePreview's returned Database, just for pdf.js's parsed state.
+ * Renders a windowed, scrollable PDF viewer for `bytes` (raw decrypted
+ * PDF) into `container`. Returns the opened pdf.js document so the
+ * caller can clean it up (`doc.destroy()`) once the preview is dismissed
+ * - same idea as sqlitePreview's returned Database, just for pdf.js's
+ * parsed state.
  */
 export async function renderPdfPreview(bytes, container) {
   container.innerHTML = '<p class="hint">Loading PDF engine…</p>';
@@ -62,53 +102,126 @@ export async function renderPdfPreview(bytes, container) {
 
   const toolbar = document.createElement("div");
   toolbar.className = "pdf-toolbar";
+  const tocToggleBtn = document.createElement("button");
+  tocToggleBtn.className = "secondary hidden";
+  tocToggleBtn.textContent = "Contents";
   const prevBtn = document.createElement("button");
   prevBtn.className = "secondary";
-  prevBtn.textContent = "◀";
-  const pageLabel = document.createElement("span");
-  pageLabel.className = "hint";
+  prevBtn.textContent = `◀ ${WINDOW_SIZE}`;
+  const pageInput = document.createElement("input");
+  pageInput.type = "number";
+  pageInput.min = "1";
+  pageInput.className = "pdf-page-input";
+  const totalLabel = document.createElement("span");
+  totalLabel.className = "hint";
+  totalLabel.textContent = `/ ${doc.numPages}`;
   const nextBtn = document.createElement("button");
   nextBtn.className = "secondary";
-  nextBtn.textContent = "▶";
-  toolbar.append(prevBtn, pageLabel, nextBtn);
+  nextBtn.textContent = `${WINDOW_SIZE} ▶`;
+  const rangeLabel = document.createElement("span");
+  rangeLabel.className = "hint";
+  toolbar.append(tocToggleBtn, prevBtn, pageInput, totalLabel, nextBtn, rangeLabel);
 
-  const canvas = document.createElement("canvas");
-  canvas.className = "pdf-canvas";
+  const body = document.createElement("div");
+  body.className = "pdf-body";
+  const tocPanel = document.createElement("div");
+  tocPanel.className = "pdf-toc hidden";
+  const pagesContainer = document.createElement("div");
+  pagesContainer.className = "pdf-pages";
+  body.append(tocPanel, pagesContainer);
 
-  wrap.append(toolbar, canvas);
+  wrap.append(toolbar, body);
   container.appendChild(wrap);
 
-  let pageNum = 1;
-  let renderTask = null;
+  let windowStart = 1;
+  let renderGeneration = 0; // bumped on every window change - lets an in-flight render notice it's stale and stop early
+  let currentPageObserver = null;
 
-  async function renderPage() {
-    pageLabel.textContent = `Page ${pageNum} / ${doc.numPages}`;
-    prevBtn.disabled = pageNum <= 1;
-    nextBtn.disabled = pageNum >= doc.numPages;
+  async function renderWindow(requestedStart) {
+    const gen = ++renderGeneration;
+    const maxStart = Math.max(1, doc.numPages - WINDOW_SIZE + 1);
+    windowStart = Math.max(1, Math.min(requestedStart, maxStart));
+    const endPage = Math.min(doc.numPages, windowStart + WINDOW_SIZE - 1);
 
-    const page = await doc.getPage(pageNum);
-    const unscaledWidth = page.getViewport({ scale: 1 }).width;
-    const fitWidth = wrap.clientWidth || 640;
-    const viewport = page.getViewport({ scale: Math.min(2, fitWidth / unscaledWidth) });
-    canvas.width = viewport.width;
-    canvas.height = viewport.height;
+    pageInput.value = windowStart;
+    prevBtn.disabled = windowStart <= 1;
+    nextBtn.disabled = endPage >= doc.numPages;
+    rangeLabel.textContent = `(pages ${windowStart}–${endPage})`;
 
-    if (renderTask) renderTask.cancel(); // a fast prev/next click can outrun the previous page's still-in-flight render
-    renderTask = page.render({ canvasContext: canvas.getContext("2d"), viewport });
-    try {
-      await renderTask.promise;
-    } catch (err) {
-      if (err?.name !== "RenderingCancelledException") throw err;
+    currentPageObserver?.disconnect();
+    pagesContainer.innerHTML = '<p class="hint">Loading pages…</p>';
+    const frag = document.createDocumentFragment();
+    const pageEls = [];
+    for (let p = windowStart; p <= endPage; p += 1) {
+      const pageWrap = document.createElement("div");
+      pageWrap.className = "pdf-page";
+      pageWrap.dataset.page = String(p);
+      const canvas = document.createElement("canvas");
+      canvas.className = "pdf-canvas";
+      pageWrap.appendChild(canvas);
+      frag.appendChild(pageWrap);
+      pageEls.push({ p, canvas, pageWrap });
+    }
+    pagesContainer.innerHTML = "";
+    pagesContainer.appendChild(frag);
+    pagesContainer.scrollTop = 0;
+
+    // Tracks whichever page is most visible while scrolling within the
+    // window and reflects it in the page field - the closest thing to
+    // "the page number" a windowed (not fully virtualized) view can give
+    // without re-fetching on every scroll tick.
+    currentPageObserver = new IntersectionObserver(
+      (observerEntries) => {
+        let best = null;
+        for (const e of observerEntries) {
+          if (e.isIntersecting && (!best || e.intersectionRatio > best.intersectionRatio)) best = e;
+        }
+        if (best && document.activeElement !== pageInput) {
+          pageInput.value = best.target.dataset.page;
+        }
+      },
+      { root: pagesContainer, threshold: [0.5] }
+    );
+
+    for (const { p, canvas, pageWrap } of pageEls) {
+      if (gen !== renderGeneration) return; // a newer window request superseded this one
+      currentPageObserver.observe(pageWrap);
+      const page = await doc.getPage(p);
+      const unscaledWidth = page.getViewport({ scale: 1 }).width;
+      const fitWidth = pagesContainer.clientWidth || 640;
+      const viewport = page.getViewport({ scale: Math.min(2, fitWidth / unscaledWidth) });
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      try {
+        await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+      } catch (err) {
+        if (err?.name !== "RenderingCancelledException") throw err;
+      }
     }
   }
 
-  prevBtn.onclick = () => {
-    if (pageNum > 1) { pageNum -= 1; renderPage(); }
-  };
-  nextBtn.onclick = () => {
-    if (pageNum < doc.numPages) { pageNum += 1; renderPage(); }
-  };
+  prevBtn.onclick = () => renderWindow(windowStart - WINDOW_SIZE);
+  nextBtn.onclick = () => renderWindow(windowStart + WINDOW_SIZE);
+  pageInput.addEventListener("change", () => {
+    const n = parseInt(pageInput.value, 10);
+    if (Number.isFinite(n)) renderWindow(n);
+  });
 
-  await renderPage();
+  let outline = null;
+  try {
+    outline = await doc.getOutline();
+  } catch {
+    outline = null; // a PDF with a broken/unsupported outline just skips the TOC panel
+  }
+  if (outline && outline.length) {
+    tocToggleBtn.classList.remove("hidden");
+    tocPanel.appendChild(buildTocList(outline, doc, (pageNum) => {
+      renderWindow(pageNum);
+      tocPanel.classList.add("hidden");
+    }));
+    tocToggleBtn.onclick = () => tocPanel.classList.toggle("hidden");
+  }
+
+  await renderWindow(1);
   return doc;
 }
